@@ -155,6 +155,7 @@ def next_scheduled_refresh(
 def schedule_signature(config: dict[str, Any]) -> str:
     return json.dumps(
         {
+            "algorithm": "per-slot-offset-v1",
             "hours": list(config["scheduled_refresh_hours"]),
             "hour_shift": int(config.get("scheduled_refresh_hour_shift", 0)),
             "offset": int(config["scheduled_refresh_offset_seconds"]),

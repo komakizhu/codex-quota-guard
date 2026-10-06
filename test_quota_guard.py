@@ -276,6 +276,40 @@ class QuotaPolicyTests(unittest.TestCase):
             guard.run_once()
             self.assertTrue(any(e["event"] == "scheduled_refresh_completed" for e in store.events))
 
+    def test_old_uniform_offset_signature_is_recomputed(self):
+        timezone = ZoneInfo("Asia/Shanghai")
+        now = datetime(2026, 10, 6, 6, 59, tzinfo=timezone).timestamp()
+        old_signature = json.dumps(
+            {
+                "hours": [7, 12, 17, 22],
+                "offset": 60,
+                "timezone": "Asia/Shanghai",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        class FakeClient:
+            def call(self, method, params):
+                return {"rateLimitsByLimitId": {"codex": {
+                    "primary": {"usedPercent": 20, "resetsAt": int(now + 3600)},
+                    "secondary": {"usedPercent": 30, "resetsAt": int(now + 86400)},
+                }}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({"notify_desktop": False})
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["next_fixed_refresh_at"] = datetime(
+                2026, 10, 6, 7, 1, tzinfo=timezone
+            ).timestamp()
+            store.state["fixed_refresh_schedule_signature"] = old_signature
+            guard = MODULE.QuotaGuard(FakeClient(), config, store, now=lambda: now)
+            self.assertEqual(
+                guard.next_fixed_refresh_at,
+                datetime(2026, 10, 6, 7, 0, tzinfo=timezone).timestamp(),
+            )
+
     def test_missed_fixed_slots_are_merged_into_one_notification(self):
         timezone = ZoneInfo("Asia/Shanghai")
         due = datetime(2026, 10, 6, 7, 1, tzinfo=timezone).timestamp()
