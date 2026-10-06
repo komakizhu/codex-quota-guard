@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.codex.quota-guard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>APP_DIR/codex_quota_guard.py</string>
+        <string>--config</string>
+        <string>USER_HOME/Library/Application Support/CodexQuotaGuard/config.json</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>~/Library/Logs/codex-quota-guard.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/Library/Logs/codex-quota-guard.error.log</string>
+</dict>
+</plist>

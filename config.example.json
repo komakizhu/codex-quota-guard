@@ -1,0 +1,25 @@
+{
+  "primary_warning_percent": 3,
+  "secondary_warning_percent": 2,
+  "post_reset_delay_seconds": 60,
+  "fallback_poll_seconds": 0,
+  "force_stop_active_turns": true,
+  "resume_paused_turns": true,
+  "auto_consume_reset_credit": false,
+  "show_status_bar_icon": true,
+  "show_dock_icon": true,
+  "notify_desktop": true,
+  "scheduled_refresh_enabled": true,
+  "scheduled_refresh_hours": [7, 12, 17, 22],
+  "scheduled_refresh_hour_shift": 0,
+  "scheduled_refresh_offset_seconds": 60,
+  "timezone": "Asia/Shanghai",
+  "app_server_socket": "~/.codex/app-server-control/app-server-control.sock",
+  "exclude_thread_ids": ["01a10a72-a54d-7e02-8b68-4100b19bd181"],
+  "resume_messages": {
+    "01a0ffd9-d6a1-76f2-868a-1fbb4f0e47c7": "额度已重置。请立即为本任务创建并启动 goal 模式，goal objective 为：完成 art导入2 导入；不进行脚本清洗；把全部导入图片放入新建的 arrrt 相册；沿用 /Users/mac/Documents/ChatGPT/arrrt导入/work 中已有进度，从下一未完成日期继续，完成后再执行相册创建和入册。请先调用 create_goal，再继续执行；不要只做普通回复。"
+  },
+  "codex_executable": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+  "state_file": "~/Library/Application Support/CodexQuotaGuard/state.json",
+  "event_log_file": "~/Library/Application Support/CodexQuotaGuard/events.jsonl"
+}
