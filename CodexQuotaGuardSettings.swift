@@ -152,7 +152,7 @@ final class SettingsModel: ObservableObject {
         let normalized = baseRefreshHours.map { hour in
             ((hour + fixedRefreshHourShift) % 24 + 24) % 24
         }
-        return Array(Set(normalized)).sorted()
+        return normalized
     }
 
     var shiftedRefreshHoursText: String {

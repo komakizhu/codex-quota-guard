@@ -124,15 +124,17 @@ def next_scheduled_refresh(
     candidates: list[datetime] = []
     # The hour shift moves the four base slots as a group, while the offset is
     # deliberately applied by slot: 7:00, 12:01, 17:02, 22:03 at 60 seconds.
-    slot_hours = [7, 12, 17, 22] if int(hour_shift) else list(hours)
-    group_shift_seconds = int(hour_shift) * 3600
+    # Persisted hours are kept in slot order so wrapped schedules remain
+    # unambiguous (for example, 13, 18, 23, 4 after a +6 hour shift).
+    slot_hours = list(hours)
+    if int(hour_shift) and slot_hours == [7, 12, 17, 22]:
+        slot_hours = [((hour + int(hour_shift)) % 24) for hour in slot_hours]
     slot_offset_seconds = max(0, int(offset_seconds))
     for day_offset in range(-1, 4):
         day = current.date() + timedelta(days=day_offset)
         for slot_index, raw_hour in enumerate(slot_hours):
             total_seconds = (
                 int(raw_hour) * 3600
-                + group_shift_seconds
                 + slot_index * slot_offset_seconds
             )
             day_carry, seconds_of_day = divmod(total_seconds, 24 * 3600)
@@ -243,14 +245,14 @@ def merged_config(value: dict[str, Any]) -> dict[str, Any]:
         if not -12 <= shift <= 12:
             raise ValueError("scheduled_refresh_hour_shift 必须在 -12 到 12 之间")
         defaults["scheduled_refresh_hour_shift"] = shift
-        defaults["scheduled_refresh_hours"] = sorted(
-            {((hour + shift) % 24) for hour in (7, 12, 17, 22)}
-        )
+        defaults["scheduled_refresh_hours"] = [
+            (hour + shift) % 24 for hour in (7, 12, 17, 22)
+        ]
     hours = defaults["scheduled_refresh_hours"]
     if isinstance(hours, str):
         hours = [part.strip() for part in hours.split(",") if part.strip()]
     try:
-        parsed_hours = sorted({int(hour) for hour in hours})
+        parsed_hours = list(dict.fromkeys(int(hour) for hour in hours))
     except (TypeError, ValueError) as error:
         raise ValueError("scheduled_refresh_hours 必须是 0–24 的整数列表") from error
     if any(hour < 0 or hour > 24 for hour in parsed_hours):

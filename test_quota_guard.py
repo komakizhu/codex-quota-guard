@@ -428,6 +428,8 @@ class QuotaPolicyTests(unittest.TestCase):
         self.assertEqual(config["scheduled_refresh_hour_shift"], 0)
         shifted = MODULE.merged_config({"scheduled_refresh_hour_shift": 1})
         self.assertEqual(shifted["scheduled_refresh_hours"], [8, 13, 18, 23])
+        wrapped = MODULE.merged_config({"scheduled_refresh_hour_shift": 6})
+        self.assertEqual(wrapped["scheduled_refresh_hours"], [13, 18, 23, 4])
 
     def test_optional_fixed_refresh_schedule_is_timezone_aware(self):
         shanghai = ZoneInfo("Asia/Shanghai")
@@ -461,7 +463,7 @@ class QuotaPolicyTests(unittest.TestCase):
         now = datetime(2026, 10, 6, 23, 2, 1, tzinfo=shanghai).timestamp()
         next_refresh = MODULE.next_scheduled_refresh(
             now,
-            [4, 13, 18, 23],
+            [13, 18, 23, 4],
             offset_seconds=60,
             timezone_name="Asia/Shanghai",
             hour_shift=6,
