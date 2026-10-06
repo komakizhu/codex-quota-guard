@@ -435,7 +435,38 @@ class QuotaPolicyTests(unittest.TestCase):
         next_refresh = MODULE.next_scheduled_refresh(
             now, [7, 12, 17, 22], offset_seconds=60, timezone_name="Asia/Shanghai"
         )
-        expected = datetime(2026, 10, 6, 7, 1, tzinfo=shanghai).timestamp()
+        expected = datetime(2026, 10, 6, 7, 0, tzinfo=shanghai).timestamp()
+        self.assertEqual(next_refresh, expected)
+
+    def test_fixed_refresh_offset_accumulates_by_five_hour_slot(self):
+        shanghai = ZoneInfo("Asia/Shanghai")
+        cases = [
+            (datetime(2026, 10, 6, 7, 0, 1), datetime(2026, 10, 6, 12, 1)),
+            (datetime(2026, 10, 6, 12, 1, 1), datetime(2026, 10, 6, 17, 2)),
+            (datetime(2026, 10, 6, 17, 2, 1), datetime(2026, 10, 6, 22, 3)),
+            (datetime(2026, 10, 6, 22, 3, 1), datetime(2026, 10, 7, 7, 0)),
+        ]
+        for now, expected in cases:
+            with self.subTest(now=now):
+                actual = MODULE.next_scheduled_refresh(
+                    now.replace(tzinfo=shanghai).timestamp(),
+                    [7, 12, 17, 22],
+                    offset_seconds=60,
+                    timezone_name="Asia/Shanghai",
+                )
+                self.assertEqual(actual, expected.replace(tzinfo=shanghai).timestamp())
+
+    def test_shifted_refresh_slots_keep_slot_offsets_across_midnight(self):
+        shanghai = ZoneInfo("Asia/Shanghai")
+        now = datetime(2026, 10, 6, 23, 2, 1, tzinfo=shanghai).timestamp()
+        next_refresh = MODULE.next_scheduled_refresh(
+            now,
+            [4, 13, 18, 23],
+            offset_seconds=60,
+            timezone_name="Asia/Shanghai",
+            hour_shift=6,
+        )
+        expected = datetime(2026, 10, 7, 4, 3, tzinfo=shanghai).timestamp()
         self.assertEqual(next_refresh, expected)
 
     def test_uses_managed_app_server_socket_by_default(self):
@@ -453,14 +484,19 @@ class QuotaPolicyTests(unittest.TestCase):
 
     def test_daily_schedule_all_slots_and_overnight_gap(self):
         timezone = ZoneInfo("Asia/Shanghai")
-        for hour, next_hour, day in [(7, 12, 6), (12, 17, 6), (17, 22, 6), (22, 7, 7)]:
-            now = datetime(2026, 10, 6, hour, 1, tzinfo=timezone).timestamp()
-            expected = datetime(2026, 10, day, next_hour, 1, tzinfo=timezone).timestamp()
+        for hour, minute, next_hour, next_minute, day in [
+            (7, 0, 12, 1, 6),
+            (12, 1, 17, 2, 6),
+            (17, 2, 22, 3, 6),
+            (22, 3, 7, 0, 7),
+        ]:
+            now = datetime(2026, 10, 6, hour, minute, 1, tzinfo=timezone).timestamp()
+            expected = datetime(2026, 10, day, next_hour, next_minute, tzinfo=timezone).timestamp()
             self.assertEqual(MODULE.next_scheduled_refresh(now, [7, 12, 17, 22], 60, "Asia/Shanghai"), expected)
 
     def test_timer_loop_reads_and_notifies_once_even_with_stale_reset(self):
         timezone = ZoneInfo("Asia/Shanghai")
-        start = datetime(2026, 10, 6, 7, 0, tzinfo=timezone).timestamp()
+        start = datetime(2026, 10, 6, 6, 59, tzinfo=timezone).timestamp()
         clock = [start]
         calls = []
         waits = []
@@ -491,7 +527,7 @@ class QuotaPolicyTests(unittest.TestCase):
             with self.assertRaises(Finished):
                 guard.run_forever()
             self.assertEqual(calls, ["account/rateLimits/read"] * 2)
-            self.assertEqual(waits, [60, 5 * 3600])
+            self.assertEqual(waits, [60, 5 * 3600 + 60])
             events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
             self.assertEqual(sum(e["event"] == "scheduled_refresh_completed" for e in events), 1)
             self.assertEqual(sum(e.get("title") == "Codex 定时额度提醒" for e in events), 1)

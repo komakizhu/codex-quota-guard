@@ -159,6 +159,22 @@ final class SettingsModel: ObservableObject {
         shiftedRefreshHours.map(String.init).joined(separator: ",")
     }
 
+    var shiftedRefreshTimesText: String {
+        let offset = max(0, Int(fixedRefreshOffset.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0)
+        let daySeconds = 24 * 60 * 60
+        return baseRefreshHours.enumerated().map { index, baseHour in
+            let totalSeconds = baseHour * 60 * 60 + fixedRefreshHourShift * 60 * 60 + index * offset
+            let normalized = ((totalSeconds % daySeconds) + daySeconds) % daySeconds
+            let hour = normalized / 3600
+            let minute = (normalized % 3600) / 60
+            let second = normalized % 60
+            if second == 0 {
+                return String(format: "%d:%02d", hour, minute)
+            }
+            return String(format: "%d:%02d:%02d", hour, minute, second)
+        }.joined(separator: "、")
+    }
+
     let configURL: URL
     private let reloadGuard: (() throws -> Void)?
 
@@ -467,13 +483,13 @@ struct SettingsView: View {
                     .accessibilityLabel("整体调整刷新时刻")
                 }
                 .disabled(!model.fixedRefreshEnabled)
-                Text("当前时刻：\(model.shiftedRefreshHoursText)")
+                Text("当前时刻：\(model.shiftedRefreshTimesText)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .disabled(!model.fixedRefreshEnabled)
                 settingRow(
-                    title: "时刻偏移",
-                    help: "相对整点延迟，默认 60 秒",
+                    title: "每个时点递增延迟",
+                    help: "第一个时点不延迟，之后每个 5 小时时点递增，默认 60 秒",
                     text: $model.fixedRefreshOffset,
                     suffix: "秒"
                 )

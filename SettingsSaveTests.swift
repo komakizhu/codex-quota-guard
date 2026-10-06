@@ -11,6 +11,10 @@ struct SettingsSaveTests {
         var reloadCount = 0
         let model = SettingsModel(configURL: url, reloadGuard: { reloadCount += 1 })
         precondition(!model.hasUnsavedChanges)
+        precondition(model.shiftedRefreshTimesText == "7:00、12:01、17:02、22:03")
+        model.fixedRefreshHourShift = 1
+        precondition(model.shiftedRefreshTimesText == "8:00、13:01、18:02、23:03")
+        model.fixedRefreshHourShift = 0
         model.primaryWarning = "invalid"
         model.save()
         precondition(model.hasUnsavedChanges)

@@ -116,19 +116,33 @@ def next_scheduled_refresh(
     hours: list[int],
     offset_seconds: int,
     timezone_name: str,
+    hour_shift: int = 0,
 ) -> float:
-    """Return the next optional fixed-clock refresh in the configured timezone."""
+    """Return the next fixed refresh, accumulating the offset per schedule slot."""
     timezone = ZoneInfo(timezone_name)
     current = datetime.fromtimestamp(now, timezone)
     candidates: list[datetime] = []
-    for day_offset in range(3):
+    # The hour shift moves the four base slots as a group, while the offset is
+    # deliberately applied by slot: 7:00, 12:01, 17:02, 22:03 at 60 seconds.
+    slot_hours = [7, 12, 17, 22] if int(hour_shift) else list(hours)
+    group_shift_seconds = int(hour_shift) * 3600
+    slot_offset_seconds = max(0, int(offset_seconds))
+    for day_offset in range(-1, 4):
         day = current.date() + timedelta(days=day_offset)
-        for raw_hour in hours:
-            hour = 0 if raw_hour == 24 else raw_hour
-            target_day = day + timedelta(days=1) if raw_hour == 24 else day
+        for slot_index, raw_hour in enumerate(slot_hours):
+            total_seconds = (
+                int(raw_hour) * 3600
+                + group_shift_seconds
+                + slot_index * slot_offset_seconds
+            )
+            day_carry, seconds_of_day = divmod(total_seconds, 24 * 3600)
+            hour, remainder = divmod(seconds_of_day, 3600)
+            minute, second = divmod(remainder, 60)
             candidate = datetime.combine(
-                target_day, datetime_time(hour=hour, minute=0), tzinfo=timezone
-            ) + timedelta(seconds=max(0, int(offset_seconds)))
+                day + timedelta(days=day_carry),
+                datetime_time(hour=hour, minute=minute, second=second),
+                tzinfo=timezone,
+            )
             if candidate.timestamp() > now:
                 candidates.append(candidate)
     if not candidates:
@@ -140,6 +154,7 @@ def schedule_signature(config: dict[str, Any]) -> str:
     return json.dumps(
         {
             "hours": list(config["scheduled_refresh_hours"]),
+            "hour_shift": int(config.get("scheduled_refresh_hour_shift", 0)),
             "offset": int(config["scheduled_refresh_offset_seconds"]),
             "timezone": str(config["timezone"]),
         },
@@ -539,6 +554,7 @@ class QuotaGuard:
             self.next_fixed_refresh_at = next_scheduled_refresh(
                 self.now(), config["scheduled_refresh_hours"],
                 config["scheduled_refresh_offset_seconds"], config["timezone"],
+                int(config.get("scheduled_refresh_hour_shift", 0)),
             )
         self.store.state["next_fixed_refresh_at"] = self.next_fixed_refresh_at
         self.store.state["fixed_refresh_schedule_signature"] = signature
@@ -1071,6 +1087,7 @@ class QuotaGuard:
                 self.config["scheduled_refresh_hours"],
                 self.config["scheduled_refresh_offset_seconds"],
                 self.config["timezone"],
+                int(self.config.get("scheduled_refresh_hour_shift", 0)),
             )
             if len(due_times) >= 100:
                 break
