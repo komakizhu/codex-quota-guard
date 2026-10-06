@@ -1,4 +1,4 @@
-# Codex Quota Guard 1.0 — Build 11
+# Codex Quota Guard 1.0 — Build 12
 
 首次公开可下载版本，适用于 Apple Silicon、macOS 15 或更新版本。
 
