@@ -494,7 +494,7 @@ struct SettingsView: View {
                     suffix: "秒"
                 )
                 .disabled(!model.fixedRefreshEnabled)
-                Text("每天到点刷新并提醒；默认延迟一分钟。重置时间仍以接口返回值为准。")
+                Text("每天到点读取额度并向配置的 Codex 对话发送刷新请求；每个时点递增延迟。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

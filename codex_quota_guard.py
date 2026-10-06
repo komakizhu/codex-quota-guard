@@ -209,6 +209,7 @@ def merged_config(value: dict[str, Any]) -> dict[str, Any]:
         "resume_paused_turns": True,
         "auto_consume_reset_credit": False,
         "notify_desktop": True,
+        "scheduled_refresh_thread_id": "",
         "dry_run": False,
         "scheduled_refresh_enabled": True,
         "scheduled_refresh_hours": [7, 12, 17, 22],
@@ -1054,6 +1055,56 @@ class QuotaGuard:
         if not pending or int(pending.get("next_retry_at") or 0) > int(self.now()):
             return
         message = self._pending_refresh_message(pending)
+        target = str(self.config.get("scheduled_refresh_thread_id") or "")
+        if target and not pending.get("conversation_submitted"):
+            if self._dry_run():
+                self.store.event("would_send_refresh_message", thread_id=target)
+            else:
+                if pending.get("conversation_attempted"):
+                    # A timeout can mean the request was accepted. Never blindly
+                    # start a second model turn for the same scheduled event.
+                    return
+                thread = self.read_thread(target)
+                status = (thread.get("status") or {}).get("type")
+                if status in ACTIVE_THREAD_STATUSES:
+                    pending["next_retry_at"] = int(self.now()) + 60
+                    self.store.save()
+                    return
+                if status == "notLoaded":
+                    result = self.client.call("thread/resume", {"threadId": target})
+                    thread = result.get("thread") or {}
+                    status = (thread.get("status") or {}).get("type")
+                if status != "idle":
+                    pending["next_retry_at"] = int(self.now()) + 60
+                    self.store.event("refresh_message_target_unavailable", thread_id=target, status=status)
+                    self.store.save()
+                    return
+                pending["conversation_attempted"] = True
+                self.store.save()
+                prompt = (
+                    "【额度守护定时会话】请立即调用 get_usage_limits 刷新五小时额度，"
+                    "简短回复五小时剩余百分比及接口返回的重置时间（北京时间）。"
+                    "这是用户授权的定时请求。不要调用 bank reset，不要创建或恢复 goal，"
+                    "不要修改项目或设置。"
+                )
+                try:
+                    result = self.client.call("turn/start", {
+                        "threadId": target,
+                        "input": [{"type": "text", "text": prompt}],
+                    })
+                    turn_id = self._started_turn_id(result)
+                    if not turn_id:
+                        raise AppServerError("会话请求返回但没有 turn id，提交状态待确认")
+                    pending["conversation_submitted"] = True
+                    pending["conversation_turn_id"] = turn_id
+                    self.store.event("scheduled_refresh_conversation_submitted", thread_id=target, turn_id=turn_id, scheduled_at=pending.get("scheduled_at"))
+                    self.store.save()
+                except AppServerError as error:
+                    self.store.event("scheduled_refresh_conversation_uncertain", thread_id=target, error=str(error))
+                    self.notify("Codex 定时会话提交待确认", str(error))
+                    pending.pop("next_retry_at", None)
+                    self.store.save()
+                    return
         if self.notify("Codex 定时额度提醒", message):
             self.store.event(
                 "scheduled_refresh_notification_delivered",

@@ -18,6 +18,33 @@ SPEC.loader.exec_module(MODULE)
 
 
 class QuotaPolicyTests(unittest.TestCase):
+    def test_scheduled_refresh_starts_real_conversation_once(self):
+        class Client:
+            def __init__(self):
+                self.started = []
+
+            def call(self, method, params):
+                if method == "thread/read":
+                    return {"thread": {"id": "target", "status": {"type": "idle"}}}
+                if method == "turn/start":
+                    self.started.append(params)
+                    return {"turn": {"id": "refresh-turn"}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            client = Client()
+            config = MODULE.merged_config({"notify_desktop": False, "scheduled_refresh_thread_id": "target"})
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            store.state["pending_scheduled_refresh"] = {"scheduled_at": 999, "next_retry_at": 1000}
+            guard._deliver_pending_refresh()
+            guard._deliver_pending_refresh()
+            self.assertEqual(len(client.started), 1)
+            self.assertEqual(client.started[0]["threadId"], "target")
+            self.assertIn("get_usage_limits", client.started[0]["input"][0]["text"])
+            self.assertIsNone(store.state["pending_scheduled_refresh"])
+
     def test_selects_codex_limit_and_computes_remaining(self):
         snapshot = {
             "rateLimitsByLimitId": {

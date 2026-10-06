@@ -34,6 +34,8 @@
 
 ## 后台启动
 
+`scheduled_refresh_thread_id` 指定定时消息的目标 Codex 对话。配置后，到点会发送真实会话请求，让 Codex 调用 `get_usage_limits` 并回复五小时额度。正在执行的对话会等到空闲再发送；请求超时或返回不明确时记录待确认，避免重复启动。该会话会使用少量模型额度，桌面通知作为附加提醒。此设置不会调用 bank reset。
+
 `LaunchAgent.template.plist` 是模板，先把其中的 `APP_DIR` 和 `USER_HOME` 替换为实际绝对路径，再复制到 `~/Library/LaunchAgents/` 并用 `launchctl bootstrap` 加载。这里不自动安装，避免未经确认改变用户的登录项。若只想暂时运行，直接使用上面的常驻命令即可。
 
 程序不会归档、handoff、删除线程，也不会给没有进行中 turn 的 idle/notLoaded 线程发送停止指令；如果控制 socket 返回的线程视图没有可验证的活动 turn，程序会明确记录“未暂停任何任务”，不会把额度周期误报为已处理。所有自动操作均写入事件日志。若要保守验证配置，可先用 `--dry-run` 运行一轮。
