@@ -124,17 +124,21 @@ final class SettingsModel: ObservableObject {
     private let baseRefreshHours = [7, 12, 17, 22]
 
     @Published var primaryWarning = "3"
-    @Published var secondaryWarning = "2"
+    @Published var secondaryWarning = "1"
     @Published var resetDelay = "60"
     @Published var forceStop = true
     @Published var resumeTasks = true
     @Published var autoBankReset = false
+    @Published var ordinaryCheckInterval = "600"
+    @Published var criticalCheckInterval = "5"
+    @Published var criticalBoundary = "20"
     @Published var showStatusBarIcon = true
     @Published var showDockIcon = true
     @Published var fixedRefreshEnabled = true
     @Published var fixedRefreshHourShift = 0
     @Published var fixedRefreshOffset = "60"
     @Published var statusMessage = ""
+    @Published var healthMessage = "检测健康状态尚未读取"
     @Published private var savedFingerprint = ""
     @Published private var feedbackFingerprint: String?
     private var configLoadError: String?
@@ -185,6 +189,7 @@ final class SettingsModel: ObservableObject {
     }
 
     func load() {
+        loadHealth()
         configLoadError = nil
         var data: Data
         var migrated = false
@@ -243,8 +248,11 @@ final class SettingsModel: ObservableObject {
         }
 
         primaryWarning = Self.number(config["primary_warning_percent"], fallback: 3).displayString
-        secondaryWarning = Self.number(config["secondary_warning_percent"], fallback: 2).displayString
+        secondaryWarning = Self.number(config["secondary_warning_percent"], fallback: 1).displayString
         resetDelay = String(Int(Self.number(config["post_reset_delay_seconds"], fallback: 60)))
+        ordinaryCheckInterval = String(Int(Self.number(config["ordinary_check_interval_seconds"], fallback: 600)))
+        criticalCheckInterval = String(Int(Self.number(config["critical_check_interval_seconds"], fallback: 5)))
+        criticalBoundary = Self.number(config["critical_boundary_percent"], fallback: 20).displayString
         forceStop = true
         resumeTasks = config["resume_paused_turns"] as? Bool ?? true
         autoBankReset = config["auto_consume_reset_credit"] as? Bool ?? false
@@ -268,8 +276,11 @@ final class SettingsModel: ObservableObject {
         guard let primary = validatedPercent(primaryWarning),
               let secondary = validatedPercent(secondaryWarning),
               let delay = Int(resetDelay.trimmingCharacters(in: .whitespacesAndNewlines)), delay >= 0,
+              let ordinary = Int(ordinaryCheckInterval.trimmingCharacters(in: .whitespacesAndNewlines)), ordinary >= 60, ordinary <= 3600,
+              let critical = Int(criticalCheckInterval.trimmingCharacters(in: .whitespacesAndNewlines)), critical >= 1, critical <= 60, critical <= ordinary,
+              let boundary = validatedPercent(criticalBoundary), boundary >= 1,
               let offset = Int(fixedRefreshOffset.trimmingCharacters(in: .whitespacesAndNewlines)), offset >= 0 else {
-            statusMessage = "请输入有效数值：百分比 0–100，延迟和偏移为非负整数秒"
+            statusMessage = "请输入有效数值：额度百分比 1–100；普通检测 60–3600 秒；临界检测 1–60 秒且不大于普通检测"
             return
         }
 
@@ -289,6 +300,9 @@ final class SettingsModel: ObservableObject {
         config["primary_warning_percent"] = primary
         config["secondary_warning_percent"] = secondary
         config["post_reset_delay_seconds"] = delay
+        config["ordinary_check_interval_seconds"] = ordinary
+        config["critical_check_interval_seconds"] = critical
+        config["critical_boundary_percent"] = boundary
         config["force_stop_active_turns"] = forceStop
         config["resume_paused_turns"] = resumeTasks
         config["auto_consume_reset_credit"] = autoBankReset
@@ -390,6 +404,22 @@ final class SettingsModel: ObservableObject {
         defaultSupportDirectory().appendingPathComponent("state.json")
     }
 
+    static func defaultHealthURL() -> URL {
+        defaultSupportDirectory().appendingPathComponent("health.json")
+    }
+
+    static func defaultReaderHealthURL() -> URL {
+        defaultSupportDirectory().appendingPathComponent("reader-health.json")
+    }
+
+    static func defaultActionsHealthURL() -> URL {
+        defaultSupportDirectory().appendingPathComponent("actions-health.json")
+    }
+
+    static func defaultWatchdogURL() -> URL {
+        defaultSupportDirectory().appendingPathComponent("watchdog.json")
+    }
+
     static func legacyConfigURL() -> URL {
         Bundle.main.bundleURL
             .deletingLastPathComponent()
@@ -404,6 +434,9 @@ final class SettingsModel: ObservableObject {
             forceStop.description,
             resumeTasks.description,
             autoBankReset.description,
+            ordinaryCheckInterval,
+            criticalCheckInterval,
+            criticalBoundary,
             showStatusBarIcon.description,
             showDockIcon.description,
             fixedRefreshEnabled.description,
@@ -414,6 +447,45 @@ final class SettingsModel: ObservableObject {
 
     private static func number(_ value: Any?, fallback: Double) -> Double {
         (value as? NSNumber)?.doubleValue ?? fallback
+    }
+
+    func loadHealth() {
+        let reader = readHealth(Self.defaultReaderHealthURL())
+        let legacyReader = reader.isEmpty ? readHealth(Self.defaultHealthURL()) : reader
+        let actions = readHealth(Self.defaultActionsHealthURL())
+        let watchdog = readHealth(Self.defaultWatchdogURL())
+        let readerStatus = legacyReader["status"] as? String ?? "未运行"
+        let actionsStatus = actions["status"] as? String ?? "未运行"
+        let watchdogStatus = watchdog["status"] as? String ?? "未运行"
+        let primary = healthWindowText(legacyReader, label: "5小时", key: "primary")
+        let secondary = healthWindowText(legacyReader, label: "总额度", key: "secondary")
+        healthMessage = "读取：\(readerStatus)；\(primary)；\(secondary)；动作：\(actionsStatus)；监督：\(watchdogStatus)"
+    }
+
+    private func readHealth(_ url: URL) -> [String: Any] {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return object
+    }
+
+    private func healthWindowText(_ health: [String: Any], label: String, key: String) -> String {
+        var status = health["\(key)_data_status"] as? String ?? "未知"
+        if let expiry = health["\(key)_data_expires_at"] as? NSNumber,
+           expiry.doubleValue < Date().timeIntervalSince1970,
+           status == "current" {
+            status = "过期"
+        }
+        guard let timestamp = health["\(key)_last_success_at"] as? NSNumber else {
+            return "\(label)：\(status)"
+        }
+        let date = Date(timeIntervalSince1970: timestamp.doubleValue)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        return "\(label)：\(status) \(formatter.string(from: date))"
     }
 }
 
@@ -453,6 +525,39 @@ struct SettingsView: View {
                 Text("额度阈值保护：固定开启")
                 Toggle("额度重置后自动恢复本轮任务", isOn: $model.resumeTasks)
                 Toggle("总额度低于阈值时自动使用 bank reset", isOn: $model.autoBankReset)
+            }
+
+            Section("三层额度检测护栏") {
+                settingRow(
+                    title: "额度充足时上限间隔",
+                    help: "梯度调度在额度充足时的最大间隔；默认 600 秒",
+                    text: $model.ordinaryCheckInterval,
+                    suffix: "秒"
+                )
+                settingRow(
+                    title: "低于 10% 安全间隔",
+                    help: "任一窗口低于 10% 后固定使用；默认 5 秒",
+                    text: $model.criticalCheckInterval,
+                    suffix: "秒"
+                )
+                settingRow(
+                    title: "梯度加速起点",
+                    help: "从此余量开始逐步缩短读取间隔；默认 20%",
+                    text: $model.criticalBoundary,
+                    suffix: "%"
+                )
+                Text("接口事件到达时立即读取；本地兜底读取不启动模型 turn。默认曲线：100%=600秒、90%=500秒、20%=200秒、19%=90秒、10%=10秒，低于10%固定5秒。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Text("检测健康")
+                    Spacer()
+                    Button("刷新") { model.loadHealth() }
+                    Text(model.healthMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                }
             }
 
             Section("图标显示") {

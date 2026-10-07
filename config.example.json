@@ -1,8 +1,21 @@
 {
   "primary_warning_percent": 3,
-  "secondary_warning_percent": 2,
+  "secondary_warning_percent": 1,
   "post_reset_delay_seconds": 60,
   "fallback_poll_seconds": 0,
+  "ordinary_check_interval_seconds": 600,
+  "critical_check_interval_seconds": 5,
+  "critical_boundary_percent": 20,
+  "quota_read_timeout_seconds": 5,
+  "health_check_interval_seconds": 5,
+  "heartbeat_interval_seconds": 5,
+  "reader_state_file": "~/Library/Application Support/CodexQuotaGuard/reader-state.json",
+  "reader_health_file": "~/Library/Application Support/CodexQuotaGuard/reader-health.json",
+  "actions_health_file": "~/Library/Application Support/CodexQuotaGuard/actions-health.json",
+  "quota_result_file": "~/Library/Application Support/CodexQuotaGuard/quota-results.jsonl",
+  "watchdog_restart_window_seconds": 600,
+  "watchdog_max_restarts": 3,
+  "watchdog_restart_cooldown_seconds": 600,
   "force_stop_active_turns": true,
   "resume_paused_turns": true,
   "auto_consume_reset_credit": false,
@@ -20,5 +33,7 @@
   "resume_messages": {},
   "codex_executable": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
   "state_file": "~/Library/Application Support/CodexQuotaGuard/state.json",
-  "event_log_file": "~/Library/Application Support/CodexQuotaGuard/events.jsonl"
+  "event_log_file": "~/Library/Application Support/CodexQuotaGuard/events.jsonl",
+  "health_file": "~/Library/Application Support/CodexQuotaGuard/health.json",
+  "watchdog_state_file": "~/Library/Application Support/CodexQuotaGuard/watchdog.json"
 }

@@ -8,6 +8,7 @@
     <array>
         <string>/usr/bin/python3</string>
         <string>APP_DIR/codex_quota_guard.py</string>
+        <string>--supervise</string>
         <string>--config</string>
         <string>USER_HOME/Library/Application Support/CodexQuotaGuard/config.json</string>
     </array>

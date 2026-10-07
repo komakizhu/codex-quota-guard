@@ -25,6 +25,10 @@ class QuotaPolicyTests(unittest.TestCase):
 
             def call(self, method, params):
                 if method == "thread/read":
+                    if self.started:
+                        return {"thread": {"id": "target", "status": {"type": "idle"}, "turns": [
+                            {"id": "refresh-turn", "status": "completed", "result": {"ok": True}}
+                        ]}}
                     return {"thread": {"id": "target", "status": {"type": "idle"}}}
                 if method == "turn/start":
                     self.started.append(params)
@@ -45,6 +49,85 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertIn("get_usage_limits", client.started[0]["input"][0]["text"])
             self.assertIsNone(store.state["pending_scheduled_refresh"])
 
+    def test_uncertain_refresh_queries_thread_before_confirmation(self):
+        class Client:
+            def __init__(self):
+                self.reads = 0
+                self.starts = 0
+
+            def call(self, method, params):
+                if method == "thread/read":
+                    self.reads += 1
+                    return {"thread": {"turns": [{"id": "turn-after-timeout", "createdAt": 1001, "status": "completed", "result": {"ok": True}}]}}
+                if method == "turn/start":
+                    self.starts += 1
+                    raise MODULE.AppServerError("request timed out")
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_thread_id": "target",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            client = Client()
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1001)
+            store.state["pending_scheduled_refresh"] = {
+                "event_id": "target:1000",
+                "scheduled_at": 1000,
+                "attempted_at": 1000,
+                "conversation_attempted": True,
+                "status": "uncertain",
+                "next_retry_at": 1001,
+                "primary_remaining": 80,
+                "secondary_remaining": 90,
+            }
+            guard._deliver_pending_refresh()
+            self.assertEqual(client.starts, 0)
+            self.assertEqual(client.reads, 2)
+            self.assertIsNone(store.state["pending_scheduled_refresh"])
+            self.assertTrue(any(
+                event["event"] == "scheduled_refresh_conversation_confirmed"
+                for event in store.events
+            ))
+
+    def test_uncertain_refresh_accepts_iso_timestamp_and_ignores_bad_candidates(self):
+        class Client:
+            def call(self, method, params):
+                if method == "thread/read":
+                    return {"thread": {"turns": [
+                        {"id": "bad", "createdAt": "not-a-time"},
+                        {"id": "turn-after-timeout", "createdAt": "2026-10-07T00:00:01Z"},
+                    ]}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_thread_id": "target",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: 1791331201)
+            store.state["pending_scheduled_refresh"] = {
+                "event_id": "target:1791331200",
+                "scheduled_at": 1791331200,
+                "attempted_at": 1791331200,
+                "conversation_attempted": True,
+                "status": "uncertain",
+                "next_retry_at": 1791331201,
+            }
+            self.assertTrue(guard._confirm_uncertain_refresh(store.state["pending_scheduled_refresh"]))
+            self.assertEqual(
+                store.state["pending_scheduled_refresh"]["conversation_turn_id"],
+                "turn-after-timeout",
+            )
+
     def test_selects_codex_limit_and_computes_remaining(self):
         snapshot = {
             "rateLimitsByLimitId": {
@@ -58,6 +141,254 @@ class QuotaPolicyTests(unittest.TestCase):
         self.assertEqual(limits.primary_remaining, 3)
         self.assertEqual(limits.secondary_remaining, 2)
         self.assertEqual(limits.primary_resets_at, 2000)
+
+    def test_invalid_quota_values_are_not_current_data(self):
+        invalid = {
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {"usedPercent": float("nan"), "resetsAt": 2000},
+                    "secondary": {"usedPercent": True, "resetsAt": 3000},
+                }
+            }
+        }
+        limits = MODULE.parse_limits(invalid)
+        self.assertIsNone(limits.primary_remaining)
+        self.assertIsNone(limits.secondary_remaining)
+        self.assertIsNone(MODULE.remaining_percent({"usedPercent": 101}))
+        self.assertIsNone(MODULE.remaining_percent({"usedPercent": float("inf")}))
+
+    def test_legacy_zero_fallback_uses_six_hundred_second_guard(self):
+        config = MODULE.merged_config({"fallback_poll_seconds": 0})
+        self.assertEqual(config["ordinary_check_interval_seconds"], 600)
+        self.assertEqual(config["critical_check_interval_seconds"], 5)
+        self.assertEqual(config["critical_boundary_percent"], 20)
+
+    def test_legacy_positive_fallback_migrates_to_ordinary_interval(self):
+        config = MODULE.merged_config({"fallback_poll_seconds": 3600})
+        self.assertEqual(config["ordinary_check_interval_seconds"], 3600)
+
+    def test_quota_gradient_uses_anchors_and_accelerates_monotonically(self):
+        config = MODULE.merged_config({})
+        expected = {
+            100: 600,
+            90: 500,
+            20: 200,
+            19: 90,
+            10: 10,
+            9.9: 5,
+            0: 5,
+        }
+        for remaining, interval in expected.items():
+            self.assertEqual(
+                MODULE.quota_gradient_interval(remaining, config), interval
+            )
+
+        samples = [100, 90, 68, 20, 19, 15, 10, 9]
+        intervals = [MODULE.quota_gradient_interval(value, config) for value in samples]
+        self.assertTrue(all(
+            previous >= current
+            for previous, current in zip(intervals, intervals[1:])
+        ))
+        self.assertGreater(intervals[2], intervals[3])
+        self.assertGreater(intervals[3], intervals[4])
+        self.assertGreater(intervals[4], intervals[5])
+
+    def test_quota_gradient_uses_the_lower_valid_window(self):
+        class Client:
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({"notify_desktop": False})
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: 1000)
+            guard.handle_limits(MODULE.Limits(80, 20, 2000, 3000, 0, [], {}))
+            self.assertEqual(store.state["quota_check_interval_seconds"], 200)
+            self.assertEqual(store.state["quota_check_mode"], "gradient")
+
+    def test_quota_deadline_is_persistent_and_not_recomputed_from_now(self):
+        class Client:
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            clock = [1000.0]
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_enabled": True,
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: clock[0])
+            guard.next_fixed_refresh_at = 100000
+            guard.handle_limits(MODULE.Limits(80, 70, 2000, 3000, 0, [], {}))
+            self.assertEqual(store.state["next_quota_check_at"], 1414)
+            clock[0] = 1050
+            self.assertEqual(guard.next_wait_seconds(), 364)
+            guard.store.event("unrelated_event")
+            self.assertEqual(guard.next_wait_seconds(), 364)
+
+    def test_critical_window_uses_five_second_deadline_and_missing_data_is_degraded(self):
+        class Client:
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            clock = [1000.0]
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "health_file": str(root / "health.json"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: clock[0])
+            guard.handle_limits(MODULE.Limits(None, 80, None, 3000, 0, [], {}))
+            self.assertEqual(store.state["quota_check_mode"], "critical")
+            self.assertEqual(store.state["quota_check_interval_seconds"], 5)
+            self.assertEqual(store.state["next_quota_check_at"], 1005)
+            self.assertEqual(store.state["primary_data_status"], "invalid")
+            self.assertEqual(store.state["secondary_data_status"], "current")
+
+    def test_health_file_records_window_times_and_status_separately(self):
+        class Client:
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "health_file": str(root / "health.json"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: 1000.0)
+            guard.handle_limits(MODULE.Limits(80, None, 2000, None, 0, [], {}))
+            health = json.loads((root / "health.json").read_text())
+            self.assertEqual(health["primary_data_status"], "current")
+            self.assertEqual(health["secondary_data_status"], "invalid")
+            self.assertEqual(health["primary_last_success_at"], 1000.0)
+            self.assertIsNone(health["secondary_last_success_at"])
+
+    def test_supervisor_limits_restart_storms_and_detects_stale_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            clock = [1000.0]
+            config = MODULE.merged_config({
+                "state_file": str(root / "state.json"),
+                "health_file": str(root / "health.json"),
+                "watchdog_state_file": str(root / "watchdog.json"),
+            })
+            supervisor = MODULE.QuotaSupervisor(
+                config,
+                root / "config.json",
+                now=lambda: clock[0],
+            )
+            self.assertTrue(supervisor._can_restart())
+            self.assertTrue(supervisor._can_restart())
+            self.assertTrue(supervisor._can_restart())
+            self.assertFalse(supervisor._can_restart())
+            self.assertIsNotNone(supervisor.suppressed_until)
+            (root / "health.json").write_text(json.dumps({"heartbeat_at": 980.0}))
+            stale, reason = supervisor._worker_is_stale()
+            self.assertTrue(stale)
+            self.assertIn("心跳", reason)
+
+    def test_supervisor_does_not_timeout_completed_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            clock = [1000.0]
+            config = MODULE.merged_config({
+                "state_file": str(root / "state.json"),
+                "health_file": str(root / "health.json"),
+                "watchdog_state_file": str(root / "watchdog.json"),
+            })
+            supervisor = MODULE.QuotaSupervisor(
+                config,
+                root / "config.json",
+                now=lambda: clock[0],
+            )
+            (root / "health.json").write_text(json.dumps({
+                "pid": 123,
+                "instance_id": "current",
+                "heartbeat_at": 999.0,
+                "request_in_flight": False,
+                "request_started_at": 900.0,
+                "request_finished_at": 901.0,
+            }))
+            supervisor.reader_pid = 123
+            supervisor.reader_instance_id = "current"
+            supervisor.reader_started_at = 900.0
+            stale, reason = supervisor._reader_is_stale()
+            self.assertFalse(stale, reason)
+
+    def test_supervisor_rejects_stale_health_from_previous_reader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "state_file": str(root / "state.json"),
+                "health_file": str(root / "health.json"),
+            })
+            supervisor = MODULE.QuotaSupervisor(config, root / "config.json", now=lambda: 1000.0)
+            (root / "health.json").write_text(json.dumps({
+                "pid": 12,
+                "instance_id": "old",
+                "heartbeat_at": 999.0,
+                "request_in_flight": False,
+            }))
+            supervisor.reader_pid = 34
+            supervisor.reader_instance_id = "new"
+            supervisor.reader_started_at = 999.0
+            stale, reason = supervisor._reader_is_stale()
+            self.assertFalse(stale, reason)
+            self.assertIn("启动", reason)
+
+    def test_supervisor_starts_reader_and_actions_as_separate_processes(self):
+        class Process:
+            next_pid = 100
+
+            def __init__(self, args):
+                self.args = args
+                self.pid = Process.next_pid
+                Process.next_pid += 1
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        processes = []
+
+        def popen(args):
+            process = Process(args)
+            processes.append(process)
+            return process
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({"state_file": str(root / "state.json")})
+            supervisor = MODULE.QuotaSupervisor(
+                config,
+                root / "config.json",
+                popen=popen,
+            )
+            self.assertTrue(supervisor._start_reader("test"))
+            self.assertTrue(supervisor._start_actions("test"))
+            self.assertEqual(processes[0].args[2], "--reader")
+            self.assertEqual(processes[1].args[2], "--actions")
+            self.assertNotEqual(processes[0].pid, processes[1].pid)
+
+    def test_client_call_preserves_one_request_deadline(self):
+        client = MODULE.AppServerClient("codex", "/tmp/unused.sock", request_timeout=5)
+        captured = []
+        client.start_if_needed = lambda deadline=None: captured.append(deadline)
+        client._write = lambda value, deadline=None: captured.append(deadline)
+        client._responses[1] = {"id": 1, "result": {"ok": True}}
+        deadline = 1234.5
+        result = client.call("test", {}, deadline=deadline)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(captured, [deadline, deadline])
 
     def test_due_after_reset_delay_uses_interface_timestamp(self):
         self.assertFalse(MODULE.reset_due(now=2059, reset_at=2000, delay=60))
@@ -443,6 +774,116 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertEqual(sleeps, [1])
             self.assertTrue(any(e["event"] == "connection_error" for e in store.events))
 
+    def test_reader_publishes_quota_result_without_running_actions(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params, **kwargs):
+                self.calls.append(method)
+                return {"rateLimitsByLimitId": {"codex": {
+                    "primary": {"usedPercent": 20, "resetsAt": 2000},
+                    "secondary": {"usedPercent": 30, "resetsAt": 3000},
+                }}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "state_file": str(root / "actions.json"),
+                "reader_state_file": str(root / "reader.json"),
+                "quota_result_file": str(root / "quota-results.jsonl"),
+                "health_file": str(root / "reader-health.json"),
+                "notify_desktop": False,
+            })
+            client = Client()
+            reader = MODULE.QuotaReader(client, config, now=lambda: 1000.0, monotonic=lambda: 1000.0)
+            limits = reader.read_once()
+            self.assertEqual(limits.primary_remaining, 80)
+            self.assertEqual(client.calls, ["account/rateLimits/read"])
+            self.assertTrue((root / "quota-results.jsonl").exists())
+            record = json.loads((root / "quota-results.jsonl").read_text().splitlines()[0])
+            self.assertEqual(record["sequence"], 1)
+            self.assertEqual(record["primary_remaining"], 80)
+
+    def test_reader_invalid_window_publishes_safe_degraded_result(self):
+        class Client:
+            def call(self, method, params, **kwargs):
+                return {"rateLimitsByLimitId": {"codex": {
+                    "primary": {"usedPercent": 20, "resetsAt": 2000},
+                    "secondary": {"usedPercent": float("nan"), "resetsAt": 3000},
+                }}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "reader_state_file": str(root / "reader.json"),
+                "reader_health_file": str(root / "reader-health.json"),
+                "quota_result_file": str(root / "quota-results.jsonl"),
+                "notify_desktop": False,
+            })
+            reader = MODULE.QuotaReader(Client(), config, now=lambda: 1000.0, monotonic=lambda: 1000.0)
+            reader.read_once()
+            self.assertEqual(reader.state["quota_check_interval_seconds"], 5)
+            record = json.loads((root / "quota-results.jsonl").read_text().splitlines()[0])
+            self.assertFalse(record["valid"])
+
+    def test_action_process_consumes_reader_result_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            result_file = root / "quota-results.jsonl"
+            result_file.write_text(json.dumps({
+                "sequence": 1,
+                "recorded_at": 1000,
+                "primary_remaining": 3,
+                "secondary_remaining": 90,
+                "primary_resets_at": 2000,
+                "secondary_resets_at": 3000,
+                "valid": True,
+            }) + "\n")
+            config = MODULE.merged_config({
+                "state_file": str(root / "actions.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "quota_result_file": str(result_file),
+                "health_file": str(root / "actions-health.json"),
+                "notify_desktop": False,
+                "force_stop_active_turns": False,
+            })
+            guard = MODULE.ActionProcess(None, config, now=lambda: 1000.0)
+            guard.process_results()
+            self.assertEqual(guard.store.state["last_consumed_quota_sequence"], 0)
+            self.assertTrue(any(event["event"] == "actions_unavailable" for event in guard.store.events))
+            guard.process_results()
+            self.assertEqual(guard.store.state["last_consumed_quota_sequence"], 0)
+
+    def test_pending_refresh_events_are_not_overwritten(self):
+        class Client:
+            def call(self, method, params):
+                if method == "thread/read":
+                    return {"thread": {"status": {"type": "active"}}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "notify_desktop": False,
+                "scheduled_refresh_enabled": True,
+                "scheduled_refresh_thread_id": "target",
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: 1000000000.0)
+            guard.next_fixed_refresh_at = 999999900.0
+            guard._process_fixed_refresh(MODULE.Limits(80, 90, 2000, 3000, 0, [], {}))
+            first = store.state["pending_scheduled_refresh"]["scheduled_at"]
+            store.state["pending_scheduled_refresh"]["status"] = "uncertain"
+            guard.next_fixed_refresh_at = 999999901.0
+            guard._process_fixed_refresh(MODULE.Limits(70, 90, 2000, 3000, 0, [], {}))
+            pending = store.state["pending_scheduled_refresh"]
+            self.assertEqual(pending["scheduled_at"], first)
+            self.assertEqual(pending["status"], "uncertain")
+            self.assertEqual(len(store.state["pending_scheduled_refresh_events"]), 2)
+
     def test_low_quota_without_verified_stop_is_not_reported_as_handled(self):
         class FakeClient:
             pass
@@ -577,7 +1018,7 @@ class QuotaPolicyTests(unittest.TestCase):
 
             def next_notification(self, timeout):
                 waits.append(timeout)
-                if len(waits) == 1:
+                if len(waits) <= 13:
                     clock[0] += timeout
                     return None
                 raise Finished()
@@ -590,7 +1031,7 @@ class QuotaPolicyTests(unittest.TestCase):
             with self.assertRaises(Finished):
                 guard.run_forever()
             self.assertEqual(calls, ["account/rateLimits/read"] * 2)
-            self.assertEqual(waits, [60, 5 * 3600 + 60])
+            self.assertEqual(waits, [5] * 14)
             events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
             self.assertEqual(sum(e["event"] == "scheduled_refresh_completed" for e in events), 1)
             self.assertEqual(sum(e.get("title") == "Codex 定时额度提醒" for e in events), 1)

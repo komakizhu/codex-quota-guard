@@ -31,6 +31,14 @@ struct SettingsSaveTests {
         precondition(reloadCount == 1)
         let reloaded = SettingsModel(configURL: url, reloadGuard: {})
         precondition(reloaded.primaryWarning == "4" && !reloaded.hasUnsavedChanges)
+        reloaded.ordinaryCheckInterval = "601"
+        reloaded.criticalCheckInterval = "5"
+        reloaded.criticalBoundary = "20"
+        reloaded.save()
+        let guarded = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        precondition((guarded["ordinary_check_interval_seconds"] as? NSNumber)?.intValue == 601)
+        precondition((guarded["critical_check_interval_seconds"] as? NSNumber)?.intValue == 5)
+        precondition((guarded["critical_boundary_percent"] as? NSNumber)?.intValue == 20)
         let failure = SettingsModel(configURL: directory.appendingPathComponent("missing/config.json"), reloadGuard: {})
         failure.save()
         precondition(!failure.hasUnsavedChanges)
