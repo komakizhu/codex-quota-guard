@@ -838,6 +838,8 @@ class QuotaPolicyTests(unittest.TestCase):
                 "secondary_remaining": 90,
                 "primary_resets_at": 2000,
                 "secondary_resets_at": 3000,
+                "primary_data_expires_at": 2005,
+                "secondary_data_expires_at": 2005,
                 "valid": True,
             }) + "\n")
             config = MODULE.merged_config({
@@ -854,6 +856,49 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertTrue(any(event["event"] == "actions_unavailable" for event in guard.store.events))
             guard.process_results()
             self.assertEqual(guard.store.state["last_consumed_quota_sequence"], 0)
+
+    def test_expired_reader_result_is_consumed_without_running_actions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            result_file = root / "quota-results.jsonl"
+            result_file.write_text(json.dumps({
+                "sequence": 1,
+                "recorded_at": 1000,
+                "primary_remaining": 2,
+                "secondary_remaining": 90,
+                "primary_resets_at": 2000,
+                "secondary_resets_at": 3000,
+                "primary_data_expires_at": 900,
+                "secondary_data_expires_at": 900,
+                "valid": True,
+            }) + "\n")
+            config = MODULE.merged_config({
+                "state_file": str(root / "actions.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "quota_result_file": str(result_file),
+                "actions_health_file": str(root / "actions-health.json"),
+                "notify_desktop": False,
+                "force_stop_active_turns": True,
+            })
+            guard = MODULE.ActionProcess(object(), config, now=lambda: 1000.0)
+            guard.process_results()
+            self.assertEqual(guard.store.state["last_consumed_quota_sequence"], 1)
+            self.assertTrue(any(event["event"] == "quota_result_expired" for event in guard.store.events))
+            self.assertEqual(guard.store.state["paused_threads"], {}, "过期结果不应触发暂停动作")
+
+    def test_dry_run_action_process_does_not_write_any_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "dry_run": True,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "quota_result_file": str(root / "quota-results.jsonl"),
+                "actions_health_file": str(root / "actions-health.json"),
+                "notify_desktop": False,
+            })
+            MODULE.ActionProcess(None, config, now=lambda: 1000.0)
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_pending_refresh_events_are_not_overwritten(self):
         class Client:

@@ -38,8 +38,8 @@
 
 `scheduled_refresh_thread_id` 指定定时消息的目标 Codex 对话。配置后，到点会发送真实会话请求，让 Codex 调用 `get_usage_limits` 并回复五小时额度。正在执行的对话会等到空闲再发送；请求超时或返回不明确时记录待确认，避免重复启动。该会话会使用少量模型额度，桌面通知作为附加提醒。此设置不会调用 bank reset。
 
-`LaunchAgent.template.plist` 是模板，先把其中的 `APP_DIR` 和 `USER_HOME` 替换为实际绝对路径，再复制到 `~/Library/LaunchAgents/` 并用 `launchctl bootstrap` 加载。模板启动的是 `--supervise`：监督进程只管理自己创建的读取进程和动作进程；读取进程 10 分钟内最多自动重启 3 次，随后暂停重启 10 分钟，避免重启风暴。动作进程异常只报警并保留未核对动作，不自动重放。这里不自动安装，避免未经确认改变用户的登录项。若只想暂时运行，可直接使用 `python3 codex_quota_guard.py --config config.json --worker`；`--worker` 只是兼容入口，会映射到完整监督结构。
+`LaunchAgent.template.plist` 是模板；需要启用新版后台时运行 `./install_quota_guard.sh`。脚本会使用当前 `python3` 的绝对路径，备份旧 LaunchAgent、配置、状态和已安装 APP，再用 `--supervise` 加载并确认 `reader-health.json`、`actions-health.json`、`watchdog.json` 的 PID、实例、配置版本和新鲜心跳；若确认超时，会卸载本次新服务并恢复备份的 LaunchAgent 与 APP。模板启动的是 `--supervise`：监督进程只管理自己创建的读取进程和动作进程；读取进程 10 分钟内最多自动重启 3 次，随后暂停重启 10 分钟，避免重启风暴。动作进程异常只报警并保留未核对动作，不自动重放。若只想暂时运行，可直接使用 `python3 codex_quota_guard.py --config config.json --worker`；`--worker` 只是兼容入口，会映射到完整监督结构。
 
-监督入口会分别启动 `--reader`、`--actions` 两个子进程。读取进程写入 `reader-health.json`、`reader-state.json` 和只追加的 `quota-results.jsonl`；动作进程写入 `actions-health.json`、现有 `state.json`；监督进程写入 `watchdog.json`。设置界面分别显示读取、动作和监督状态，并显示两个额度窗口的最后成功时间与过期状态。动作失败或接口持续不可用不会被旧额度掩盖，也不会把额度检测成功宣称为任务暂停成功。
+监督入口会分别启动 `--reader`、`--actions` 两个子进程。读取进程写入 `reader-health.json`、`reader-state.json` 和只追加的 `quota-results.jsonl`；动作进程写入 `actions-health.json`、现有 `state.json`；监督进程写入 `watchdog.json`。动作进程消费结果前会检查两个窗口的数据期限；过期或缺少期限的历史结果只记录并推进序号，不会触发暂停、恢复、定时会话或 bank reset。设置界面分别显示读取、动作和监督状态，并显示刷新时间、两个额度窗口的最后成功时间与过期状态；旧 `health.json` 只作为诊断提示，不能代表新版三层后台已运行。动作失败或接口持续不可用不会被旧额度掩盖，也不会把额度检测成功宣称为任务暂停成功。
 
 程序不会归档、handoff、删除线程，也不会给没有进行中 turn 的 idle/notLoaded 线程发送停止指令；如果控制 socket 返回的线程视图没有可验证的活动 turn，程序会明确记录“未暂停任何任务”，不会把额度周期误报为已处理。所有自动操作均写入事件日志。若要保守验证配置，可先用 `--dry-run` 运行一轮。

@@ -375,7 +375,10 @@ final class SettingsModel: ObservableObject {
                 while Date() < deadline {
                     if let data = try? Data(contentsOf: stateURL),
                        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       object["config_revision"] as? String == revision {
+                       object["config_revision"] as? String == revision,
+                       self.healthFileIsFresh(Self.defaultReaderHealthURL(), revision: revision),
+                       self.healthFileIsFresh(Self.defaultActionsHealthURL(), revision: revision),
+                       self.healthFileIsFresh(Self.defaultWatchdogURL(), revision: revision) {
                         confirmed = true
                         break
                     }
@@ -389,6 +392,20 @@ final class SettingsModel: ObservableObject {
                 DispatchQueue.main.async { completion(error) }
             }
         }
+    }
+
+    private func healthFileIsFresh(_ url: URL, revision: String) -> Bool {
+        guard let health = readHealth(url),
+              health["config_revision"] as? String == revision,
+              let pid = health["pid"] as? NSNumber,
+              pid.intValue > 0,
+              let instance = health["instance_id"] as? String,
+              !instance.isEmpty,
+              let heartbeat = health["heartbeat_at"] as? NSNumber else {
+            return false
+        }
+        let configuredInterval = (health["heartbeat_interval_seconds"] as? NSNumber)?.doubleValue ?? 5
+        return Date().timeIntervalSince1970 - heartbeat.doubleValue <= max(15, configuredInterval * 3)
     }
 
     static func defaultConfigURL() -> URL {
@@ -451,26 +468,57 @@ final class SettingsModel: ObservableObject {
 
     func loadHealth() {
         let reader = readHealth(Self.defaultReaderHealthURL())
-        let legacyReader = reader.isEmpty ? readHealth(Self.defaultHealthURL()) : reader
+        let legacy = readHealth(Self.defaultHealthURL())
         let actions = readHealth(Self.defaultActionsHealthURL())
         let watchdog = readHealth(Self.defaultWatchdogURL())
-        let readerStatus = legacyReader["status"] as? String ?? "未运行"
-        let actionsStatus = actions["status"] as? String ?? "未运行"
-        let watchdogStatus = watchdog["status"] as? String ?? "未运行"
-        let primary = healthWindowText(legacyReader, label: "5小时", key: "primary")
-        let secondary = healthWindowText(legacyReader, label: "总额度", key: "secondary")
-        healthMessage = "读取：\(readerStatus)；\(primary)；\(secondary)；动作：\(actionsStatus)；监督：\(watchdogStatus)"
+        let readerStatus = processHealthText(reader, label: "读取")
+        let actionsStatus = processHealthText(actions, label: "动作")
+        let watchdogStatus = processHealthText(watchdog, label: "监督")
+        let primary = healthWindowText(reader, label: "5小时", key: "primary")
+        let secondary = healthWindowText(reader, label: "总额度", key: "secondary")
+        let legacyHint = reader == nil && legacy != nil ? "；旧健康文件仅供诊断" : ""
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "HH:mm:ss"
+        healthMessage = "刷新 \(formatter.string(from: Date()))；\(readerStatus)；\(primary)；\(secondary)；\(actionsStatus)；\(watchdogStatus)\(legacyHint)"
     }
 
-    private func readHealth(_ url: URL) -> [String: Any] {
+    private func readHealth(_ url: URL) -> [String: Any]? {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
         guard let data = try? Data(contentsOf: url),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return [:]
+            return ["_read_error": true]
         }
         return object
     }
 
-    private func healthWindowText(_ health: [String: Any], label: String, key: String) -> String {
+    private func processHealthText(_ health: [String: Any]?, label: String) -> String {
+        guard let health else { return "\(label)：未运行" }
+        if health["_read_error"] as? Bool == true { return "\(label)：文件损坏" }
+        guard let pid = health["pid"] as? NSNumber,
+              pid.intValue > 0,
+              let instance = health["instance_id"] as? String,
+              !instance.isEmpty,
+              let heartbeat = health["heartbeat_at"] as? NSNumber else {
+            return "\(label)：状态无效"
+        }
+        let heartbeatInterval = (health["heartbeat_interval_seconds"] as? NSNumber)?.doubleValue ?? 5
+        if Date().timeIntervalSince1970 - heartbeat.doubleValue > max(15, heartbeatInterval * 3) {
+            return "\(label)：心跳过期"
+        }
+        let status = health["status"] as? String ?? "未知"
+        if let error = health["error"] as? String, !error.isEmpty {
+            return "\(label)：\(status)（\(error)）"
+        }
+        return "\(label)：\(status)"
+    }
+
+    private func healthWindowText(_ health: [String: Any]?, label: String, key: String) -> String {
+        guard let health else { return "\(label)：未运行" }
+        if health["_read_error"] as? Bool == true { return "\(label)：文件损坏" }
         var status = health["\(key)_data_status"] as? String ?? "未知"
         if let expiry = health["\(key)_data_expires_at"] as? NSNumber,
            expiry.doubleValue < Date().timeIntervalSince1970,

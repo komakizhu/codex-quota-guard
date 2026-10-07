@@ -19,8 +19,8 @@
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
-    <string>~/Library/Logs/codex-quota-guard.log</string>
+    <string>USER_HOME/Library/Logs/codex-quota-guard.log</string>
     <key>StandardErrorPath</key>
-    <string>~/Library/Logs/codex-quota-guard.error.log</string>
+    <string>USER_HOME/Library/Logs/codex-quota-guard.error.log</string>
 </dict>
 </plist>

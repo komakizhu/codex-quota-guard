@@ -931,6 +931,7 @@ class QuotaGuard:
             "instance_id": self.config.get("_process_instance_id"),
             "process_started_at": self.process_started_at,
             "heartbeat_at": time.time(),
+            "heartbeat_interval_seconds": self.config.get("heartbeat_interval_seconds", 5),
             "status": status,
             "config_revision": self.config.get("config_revision"),
             "quota_sequence": self.store.state.get("quota_sequence", 0),
@@ -1975,7 +1976,9 @@ class QuotaReader:
             "instance_id": self.instance_id,
             "process_started_at": self.process_started_at,
             "heartbeat_at": time.time(),
+            "heartbeat_interval_seconds": self.config.get("heartbeat_interval_seconds", 5),
             "status": status,
+            "config_revision": self.config.get("config_revision"),
             "quota_sequence": self.state.get("quota_sequence", 0),
             "next_quota_check_at": self.next_quota_check_at,
             "primary_last_success_at": self.state.get("primary_last_success_at"),
@@ -2030,6 +2033,10 @@ class QuotaReader:
             "secondary_resets_at": limits.secondary_resets_at,
             "reset_credit_count": limits.reset_credit_count,
             "reset_credits": limits.reset_credits,
+            "primary_data_status": self.state["primary_data_status"],
+            "secondary_data_status": self.state["secondary_data_status"],
+            "primary_data_expires_at": self.state["primary_data_expires_at"],
+            "secondary_data_expires_at": self.state["secondary_data_expires_at"],
             "valid": limits.primary_remaining is not None and limits.secondary_remaining is not None and error is None,
             "error": error,
         }
@@ -2153,11 +2160,36 @@ class ActionProcess:
         self.store = StateStore(
             pathlib.Path(self.config["state_file"]).expanduser(),
             pathlib.Path(self.config["event_log_file"]).expanduser(),
+            persist=not bool(self.config.get("dry_run")),
         )
         self.guard = QuotaGuard(client, self.config, self.store, now=now, sleep=sleep)
 
+    def _record_validity(self, record: dict[str, Any]) -> str:
+        """Return whether a published reader result is safe for actions."""
+        if record.get("valid") is not True:
+            return "invalid"
+        recorded_at = timestamp_value(record.get("recorded_at"))
+        if recorded_at is None:
+            return "missing_timestamp"
+        for label in ("primary", "secondary"):
+            value = record.get(f"{label}_remaining")
+            if isinstance(value, bool):
+                return f"{label}_invalid"
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return f"{label}_invalid"
+            if not math.isfinite(numeric) or not 0.0 <= numeric <= 100.0:
+                return f"{label}_invalid"
+            expires_at = timestamp_value(record.get(f"{label}_data_expires_at"))
+            if expires_at is None:
+                return f"{label}_missing_expiry"
+            if self.now() > expires_at:
+                return f"{label}_expired"
+        return "current"
+
     def _limits_from_record(self, record: dict[str, Any]) -> Limits | None:
-        if not record.get("valid"):
+        if self._record_validity(record) != "current":
             return None
         return Limits(
             record.get("primary_remaining"),
@@ -2179,11 +2211,17 @@ class ActionProcess:
             sequence = int(record.get("sequence") or 0)
             if sequence <= consumed:
                 continue
-            limits = self._limits_from_record(record)
+            validity = self._record_validity(record)
+            limits = self._limits_from_record(record) if validity == "current" else None
             if limits is None:
                 consumed = sequence
                 self.store.state["last_consumed_quota_sequence"] = sequence
-                self.store.event("quota_result_invalid", sequence=sequence, error=record.get("error"))
+                self.store.event(
+                    "quota_result_expired" if "expired" in validity else "quota_result_invalid",
+                    sequence=sequence,
+                    reason=validity,
+                    error=record.get("error"),
+                )
                 self.store.save()
                 continue
             if self.client is None:
@@ -2202,6 +2240,9 @@ class ActionProcess:
                 "secondary_remaining": limits.secondary_remaining,
                 "primary_resets_at": limits.primary_resets_at,
                 "secondary_resets_at": limits.secondary_resets_at,
+                "recorded_at": record.get("recorded_at"),
+                "primary_data_expires_at": record.get("primary_data_expires_at"),
+                "secondary_data_expires_at": record.get("secondary_data_expires_at"),
             }
             self.store.save()
 
@@ -2211,6 +2252,10 @@ class ActionProcess:
             return None
         if value.get("primary_remaining") is None or value.get("secondary_remaining") is None:
             return None
+        for label in ("primary", "secondary"):
+            expires_at = timestamp_value(value.get(f"{label}_data_expires_at"))
+            if expires_at is None or self.now() > expires_at:
+                return None
         return Limits(
             value["primary_remaining"],
             value["secondary_remaining"],
@@ -2239,8 +2284,21 @@ class ActionProcess:
                 self.guard._write_health("actions_error", error=str(error))
                 if self.client is not None:
                     self.client.close()
-                self.sleep(min(60, backoff))
+                self._interruptible_reconnect_sleep(min(60, backoff))
                 backoff = min(60, backoff * 2)
+
+    def _interruptible_reconnect_sleep(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        heartbeat = max(1.0, float(self.config["heartbeat_interval_seconds"]))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self.guard._write_health(
+                "waiting_reconnect",
+                reconnect_backoff_seconds=max(0.0, remaining),
+            )
+            self.sleep(min(heartbeat, remaining))
 
 
 class QuotaSupervisor:
@@ -2270,6 +2328,9 @@ class QuotaSupervisor:
         self.now = now
         self.sleep = sleep
         self.popen = popen
+        self.instance_id = str(uuid.uuid4())
+        self.process_started_at = time.time()
+        self.config["_process_instance_id"] = self.instance_id
         self.reader: subprocess.Popen[Any] | None = None
         self.actions: subprocess.Popen[Any] | None = None
         # Compatibility aliases for older tests and status readers.
@@ -2306,7 +2367,10 @@ class QuotaSupervisor:
             return
         payload = {
             "pid": os.getpid(),
+            "instance_id": self.instance_id,
+            "process_started_at": self.process_started_at,
             "heartbeat_at": time.time(),
+            "heartbeat_interval_seconds": self.config.get("heartbeat_interval_seconds", 5),
             "status": status,
             "reader_pid": getattr(self.reader, "pid", None) if self.reader else None,
             "actions_pid": getattr(self.actions, "pid", None) if self.actions else None,
@@ -2343,7 +2407,6 @@ class QuotaSupervisor:
     def _alert_once(self, key: str, title: str, message: str) -> None:
         if key in self.alerted_keys or not self.config.get("notify_desktop", True):
             return
-        self.alerted_keys.add(key)
         script = f'display notification {json.dumps(message, ensure_ascii=False)} with title {json.dumps(title, ensure_ascii=False)}'
         try:
             subprocess.run(
@@ -2353,6 +2416,7 @@ class QuotaSupervisor:
                 stderr=subprocess.DEVNULL,
                 timeout=5,
             )
+            self.alerted_keys.add(key)
         except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
             pass
 
@@ -2595,15 +2659,18 @@ class QuotaSupervisor:
 
             expired = self._expired_windows()
             if expired:
-                expired_key = f"quota-expired:{','.join(expired)}"
-                self._alert_once(
-                    expired_key,
-                    "Codex 额度数据过期",
-                    f"{', '.join(expired)} 额度没有在期限内更新，当前旧值不再视为正常",
-                )
+                for label in ("primary", "secondary"):
+                    if label in expired:
+                        self._alert_once(
+                            f"quota-expired:{label}",
+                            "Codex 额度数据过期",
+                            f"{label} 额度没有在期限内更新，当前旧值不再视为正常",
+                        )
+                    else:
+                        self.alerted_keys.discard(f"quota-expired:{label}")
             else:
-                self.alerted_keys.discard("quota-expired:primary")
-                self.alerted_keys.discard("quota-expired:secondary")
+                for label in ("primary", "secondary"):
+                    self.alerted_keys.discard(f"quota-expired:{label}")
 
             if reader_reason is not None or expired:
                 self._write_health(
