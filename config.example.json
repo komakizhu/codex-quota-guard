@@ -7,6 +7,8 @@
   "critical_check_interval_seconds": 5,
   "critical_boundary_percent": 20,
   "quota_read_timeout_seconds": 5,
+  "reader_quota_read_timeout_seconds": 30,
+  "scheduled_refresh_read_timeout_seconds": 30,
   "health_check_interval_seconds": 5,
   "heartbeat_interval_seconds": 5,
   "reader_state_file": "~/Library/Application Support/CodexQuotaGuard/reader-state.json",

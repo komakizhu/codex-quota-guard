@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 
@@ -49,6 +50,7 @@ class QuotaPolicyTests(unittest.TestCase):
             client = Client()
             store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
             guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            guard._prepare_refresh_tool_snapshot()
             result = guard._handle_refresh_dynamic_tool(
                 "item/tool/call",
                 {"tool": "get_usage_limits", "arguments": {}},
@@ -60,6 +62,49 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertEqual(snapshot["secondary_resets_at"], 3000)
             self.assertEqual(snapshot["reset_credit_count"], 1)
             self.assertEqual([method for method, _ in client.calls], ["account/rateLimits/read"])
+
+    def test_refresh_tool_connection_uses_scheduled_timeout_for_cold_start(self):
+        class FakeAppServerClient:
+            instances = []
+
+            def __init__(self, executable, socket_path, request_timeout=30.0):
+                self.executable = executable
+                self.socket_path = socket_path
+                self.request_timeout = request_timeout
+                self.socket = None
+                self._connection_error = None
+                self.start_deadline = None
+                self.__class__.instances.append(self)
+
+            def start(self, deadline=None):
+                self.start_deadline = deadline
+                self.socket = object()
+
+            def close(self):
+                self.socket = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "scheduled_refresh_read_timeout_seconds": 30,
+                "quota_read_timeout_seconds": 5,
+            })
+            base_client = FakeAppServerClient("codex", "/tmp/socket")
+            guard = MODULE.QuotaGuard(
+                base_client,
+                config,
+                MODULE.StateStore(root / "state.json", root / "events.jsonl"),
+                now=lambda: 1000.0,
+                monotonic=lambda: 1000.0,
+            )
+            with patch.object(MODULE, "AppServerClient", FakeAppServerClient):
+                client = guard._ensure_refresh_tool_client()
+            self.assertIs(client, FakeAppServerClient.instances[-1])
+            self.assertEqual(client.request_timeout, 30.0)
+            self.assertEqual(client.start_deadline, 1030.0)
 
     def test_scheduled_refresh_starts_real_conversation_once(self):
         class Client:
@@ -196,6 +241,12 @@ class QuotaPolicyTests(unittest.TestCase):
                             "id": "bridge-turn",
                             "status": "completed",
                             "result": {"ok": True},
+                            "items": [{
+                                "type": "dynamicToolCall",
+                                "tool": "get_usage_limits",
+                                "status": "completed",
+                                "success": True,
+                            }],
                         }],
                     }}
                 if method == "turn/start":
@@ -249,7 +300,17 @@ class QuotaPolicyTests(unittest.TestCase):
                 if method == "thread/read":
                     return {"thread": {
                         "status": {"type": "idle"},
-                        "turns": [{"id": "bridge-turn", "status": "completed", "result": {"ok": True}}],
+                        "turns": [{
+                            "id": "bridge-turn",
+                            "status": "completed",
+                            "result": {"ok": True},
+                            "items": [{
+                                "type": "dynamicToolCall",
+                                "tool": "get_usage_limits",
+                                "status": "completed",
+                                "success": True,
+                            }],
+                        }],
                     }}
                 if method == "turn/start":
                     return {"turn": {"id": "bridge-turn"}}
@@ -294,6 +355,12 @@ class QuotaPolicyTests(unittest.TestCase):
                             "id": "bridge-turn",
                             "status": "completed",
                             "result": {"ok": True},
+                            "items": [{
+                                "type": "dynamicToolCall",
+                                "tool": "get_usage_limits",
+                                "status": "completed",
+                                "success": True,
+                            }],
                         }],
                     }}
                 if method == "turn/start":
@@ -356,6 +423,12 @@ class QuotaPolicyTests(unittest.TestCase):
                             "id": turn_id,
                             "status": "completed",
                             "result": {"ok": True},
+                            "items": [{
+                                "type": "dynamicToolCall",
+                                "tool": "get_usage_limits",
+                                "status": "completed",
+                                "success": True,
+                            }],
                         }] if self.turn_number else []),
                     }}
                 if method == "turn/start":
@@ -454,6 +527,7 @@ class QuotaPolicyTests(unittest.TestCase):
             root = pathlib.Path(directory)
             config = MODULE.merged_config({
                 "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server",
                 "state_file": str(root / "state.json"),
                 "event_log_file": str(root / "events.jsonl"),
             })
@@ -471,6 +545,49 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertTrue(any(
                 event["event"] == "scheduled_refresh_execution_confirmed"
                 and event["completion_evidence"] == "turn"
+                for event in store.events
+            ))
+
+    def test_bridge_does_not_confirm_turn_when_quota_tool_failed(self):
+        class Client:
+            def call(self, method, params):
+                if method == "thread/read":
+                    return {"thread": {
+                        "status": {"type": "idle"},
+                        "turns": [{
+                            "id": "refresh-turn",
+                            "status": "completed",
+                            "items": [{
+                                "type": "dynamicToolCall",
+                                "tool": "get_usage_limits",
+                                "status": "failed",
+                                "success": False,
+                            }],
+                        }],
+                    }}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server_bridge",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: 1000)
+            pending = {
+                "event_id": "bridge:failed",
+                "target_thread_id": "bridge",
+                "conversation_turn_id": "refresh-turn",
+                "conversation_submitted": True,
+                "status": "accepted",
+            }
+            self.assertFalse(guard._confirm_submitted_refresh(pending))
+            self.assertEqual(pending["status"], "accepted")
+            self.assertTrue(any(
+                event["event"] == "scheduled_refresh_execution_failed"
                 for event in store.events
             ))
 
@@ -742,6 +859,32 @@ class QuotaPolicyTests(unittest.TestCase):
             supervisor.reader_started_at = 900.0
             stale, reason = supervisor._reader_is_stale()
             self.assertFalse(stale, reason)
+
+    def test_supervisor_waits_for_bounded_in_flight_request_before_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "state_file": str(root / "state.json"),
+                "health_file": str(root / "health.json"),
+            })
+            supervisor = MODULE.QuotaSupervisor(
+                config,
+                root / "config.json",
+                now=lambda: 1000.0,
+            )
+            (root / "health.json").write_text(json.dumps({
+                "pid": 123,
+                "instance_id": "current",
+                "heartbeat_at": 980.0,
+                "request_in_flight": True,
+                "request_deadline_at": 1010.0,
+            }))
+            supervisor.reader_pid = 123
+            supervisor.reader_instance_id = "current"
+            supervisor.reader_started_at = 900.0
+            stale, reason = supervisor._reader_is_stale()
+            self.assertFalse(stale, reason)
+            self.assertIn("进行中", reason)
 
     def test_supervisor_rejects_stale_health_from_previous_reader(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1292,6 +1435,37 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertEqual(record["sequence"], 1)
             self.assertEqual(record["primary_remaining"], 80)
 
+    def test_reader_uses_real_managed_app_server_timeout_budget(self):
+        class Client:
+            def __init__(self):
+                self.deadlines = []
+
+            def call(self, method, params, **kwargs):
+                self.deadlines.append(kwargs["deadline"])
+                return {"rateLimitsByLimitId": {"codex": {
+                    "primary": {"usedPercent": 20, "resetsAt": 2000},
+                    "secondary": {"usedPercent": 30, "resetsAt": 3000},
+                }}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "reader_state_file": str(root / "reader.json"),
+                "reader_health_file": str(root / "reader-health.json"),
+                "quota_result_file": str(root / "quota-results.jsonl"),
+                "notify_desktop": False,
+            })
+            client = Client()
+            reader = MODULE.QuotaReader(
+                client,
+                config,
+                now=lambda: 1000.0,
+                monotonic=lambda: 1000.0,
+            )
+            reader.read_once()
+            self.assertEqual(config["reader_quota_read_timeout_seconds"], 30)
+            self.assertEqual(client.deadlines, [1030.0])
+
     def test_reader_invalid_window_publishes_safe_degraded_result(self):
         class Client:
             def call(self, method, params, **kwargs):
@@ -1372,6 +1546,145 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertEqual(guard.store.state["last_consumed_quota_sequence"], 1)
             self.assertTrue(any(event["event"] == "quota_result_expired" for event in guard.store.events))
             self.assertEqual(guard.store.state["paused_threads"], {}, "过期结果不应触发暂停动作")
+
+    def test_action_health_mirrors_latest_reader_window_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            result_file = root / "quota-results.jsonl"
+            result_file.write_text(json.dumps({
+                "sequence": 12,
+                "recorded_at": 1000,
+                "primary_remaining": 76,
+                "secondary_remaining": 42,
+                "primary_resets_at": 2000,
+                "secondary_resets_at": 3000,
+                "primary_data_status": "current",
+                "secondary_data_status": "current",
+                "primary_data_expires_at": 1300,
+                "secondary_data_expires_at": 1300,
+                "valid": True,
+            }) + "\n")
+            config = MODULE.merged_config({
+                "state_file": str(root / "actions.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "quota_result_file": str(result_file),
+                "actions_health_file": str(root / "actions-health.json"),
+                "notify_desktop": False,
+                "force_stop_active_turns": False,
+            })
+            guard = MODULE.ActionProcess(object(), config, now=lambda: 1000.0)
+            guard.process_results()
+            health = json.loads((root / "actions-health.json").read_text())
+            self.assertEqual(guard.store.state["last_consumed_quota_sequence"], 12)
+            self.assertEqual(health["quota_sequence"], 12)
+            self.assertEqual(health["primary_data_status"], "current")
+            self.assertEqual(health["secondary_data_status"], "current")
+
+    def test_action_health_restores_latest_observed_limits_on_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_file = root / "actions.json"
+            event_file = root / "events.jsonl"
+            state = MODULE.default_state()
+            state.update({
+                "last_consumed_quota_sequence": 21,
+                "last_observed_limits": {
+                    "primary_remaining": 76,
+                    "secondary_remaining": 42,
+                    "primary_resets_at": 2000,
+                    "secondary_resets_at": 3000,
+                    "recorded_at": 1000,
+                    "primary_data_expires_at": 1300,
+                    "secondary_data_expires_at": 1300,
+                },
+            })
+            state_file.write_text(json.dumps(state))
+            config = MODULE.merged_config({
+                "state_file": str(state_file),
+                "event_log_file": str(event_file),
+                "quota_result_file": str(root / "quota-results.jsonl"),
+                "actions_health_file": str(root / "actions-health.json"),
+                "notify_desktop": False,
+            })
+            guard = MODULE.ActionProcess(object(), config, now=lambda: 1000.0)
+            health = json.loads((root / "actions-health.json").read_text())
+            self.assertEqual(guard.store.state["quota_sequence"], 21)
+            self.assertEqual(health["primary_data_status"], "current")
+            self.assertEqual(health["secondary_data_status"], "current")
+
+    def test_action_restart_preserves_latest_invalid_reader_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state_file = root / "actions.json"
+            event_file = root / "events.jsonl"
+            state = MODULE.default_state()
+            state.update({
+                "last_consumed_quota_sequence": 21,
+                "last_observed_limits": {
+                    "primary_remaining": 76,
+                    "secondary_remaining": 42,
+                    "primary_resets_at": 2000,
+                    "secondary_resets_at": 3000,
+                    "recorded_at": 1000,
+                    "primary_data_status": "current",
+                    "secondary_data_status": "current",
+                    "primary_data_expires_at": 1300,
+                    "secondary_data_expires_at": 1300,
+                },
+            })
+            state_file.write_text(json.dumps(state))
+            result_file = root / "quota-results.jsonl"
+            result_file.write_text(json.dumps({
+                "sequence": 22,
+                "recorded_at": 1001,
+                "primary_remaining": None,
+                "secondary_remaining": None,
+                "primary_resets_at": None,
+                "secondary_resets_at": None,
+                "primary_data_status": "invalid",
+                "secondary_data_status": "invalid",
+                "primary_data_expires_at": 1001,
+                "secondary_data_expires_at": 1001,
+                "valid": False,
+                "error": "quota read failed",
+            }) + "\n")
+            config = MODULE.merged_config({
+                "state_file": str(state_file),
+                "event_log_file": str(event_file),
+                "quota_result_file": str(result_file),
+                "actions_health_file": str(root / "actions-health.json"),
+                "notify_desktop": False,
+            })
+            first = MODULE.ActionProcess(object(), config, now=lambda: 1001.0)
+            first.process_results()
+            second = MODULE.ActionProcess(object(), config, now=lambda: 1001.0)
+            health = json.loads((root / "actions-health.json").read_text())
+            self.assertEqual(second.store.state["last_consumed_quota_sequence"], 22)
+            self.assertEqual(health["primary_data_status"], "invalid")
+            self.assertEqual(health["secondary_data_status"], "invalid")
+
+    def test_action_validation_rejects_explicit_invalid_window_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "state_file": str(root / "actions.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "quota_result_file": str(root / "quota-results.jsonl"),
+                "actions_health_file": str(root / "actions-health.json"),
+                "notify_desktop": False,
+            })
+            guard = MODULE.ActionProcess(object(), config, now=lambda: 1000.0)
+            record = {
+                "valid": True,
+                "recorded_at": 1000,
+                "primary_remaining": 76,
+                "secondary_remaining": 42,
+                "primary_data_status": "invalid",
+                "secondary_data_status": "current",
+                "primary_data_expires_at": 1300,
+                "secondary_data_expires_at": 1300,
+            }
+            self.assertEqual(guard._record_validity(record), "primary_invalid")
 
     def test_dry_run_action_process_does_not_write_any_files(self):
         with tempfile.TemporaryDirectory() as directory:

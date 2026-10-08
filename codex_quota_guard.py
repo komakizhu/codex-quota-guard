@@ -145,6 +145,19 @@ def timestamp_value(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def effective_window_status(
+    state: dict[str, Any],
+    label: str,
+    now: float,
+) -> str:
+    """Expose expired data as expired even before the next read attempt."""
+    status = str(state.get(f"{label}_data_status") or "unknown")
+    expiry = timestamp_value(state.get(f"{label}_data_expires_at"))
+    if status == "current" and expiry is not None and now > expiry:
+        return "expired"
+    return status
+
+
 @dataclass(frozen=True)
 class Limits:
     primary_remaining: float | None
@@ -357,6 +370,12 @@ def merged_config(value: dict[str, Any]) -> dict[str, Any]:
         "critical_check_interval_seconds": 5,
         "critical_boundary_percent": 20,
         "quota_read_timeout_seconds": 5,
+        # The managed desktop app-server's rate-limit RPC is materially
+        # slower than ordinary control calls on this host. Keep the generic
+        # action budget at 5s, but give the isolated reader a bounded budget
+        # large enough to accept a real current quota response.
+        "reader_quota_read_timeout_seconds": 30,
+        "scheduled_refresh_read_timeout_seconds": 30,
         "health_check_interval_seconds": 5,
         "heartbeat_interval_seconds": 5,
         "watchdog_restart_window_seconds": 600,
@@ -430,6 +449,8 @@ def merged_config(value: dict[str, Any]) -> dict[str, Any]:
         "ordinary_check_interval_seconds": (60, 3600),
         "critical_check_interval_seconds": (1, 60),
         "quota_read_timeout_seconds": (1, 30),
+        "reader_quota_read_timeout_seconds": (5, 30),
+        "scheduled_refresh_read_timeout_seconds": (5, 30),
         "health_check_interval_seconds": (1, 30),
         "heartbeat_interval_seconds": (1, 10),
         "watchdog_restart_window_seconds": (60, 3600),
@@ -953,6 +974,9 @@ class QuotaGuard:
         self.now = now
         self.sleep = sleep
         self.monotonic = monotonic
+        self.dynamic_tool_client: AppServerClient | None = None
+        self.dynamic_tool_limits: Limits | None = None
+        self.dynamic_tool_limits_at: float | None = None
         self.process_started_at = time.time()
         self.health_file = pathlib.Path(
             str(config.get("health_file") or self.store.state_file.with_name("health.json"))
@@ -995,16 +1019,22 @@ class QuotaGuard:
         self._write_health("starting")
         self.store.save()
 
-    def read_limits(self) -> Limits:
+    def read_limits(
+        self,
+        client: Any | None = None,
+        deadline: float | None = None,
+    ) -> Limits:
         started_at = self.now()
         request_id = str(uuid.uuid4())
-        request_deadline = self.monotonic() + float(self.config["quota_read_timeout_seconds"])
+        quota_client = client if client is not None else self.client
+        request_deadline = deadline or (
+            self.monotonic() + float(self.config["quota_read_timeout_seconds"])
+        )
+        timeout_budget = max(0.0, request_deadline - self.monotonic())
         self.store.state["quota_read_started_at"] = started_at
         self.store.state["request_in_flight"] = True
         self.store.state["request_id"] = request_id
-        self.store.state["request_deadline_at"] = started_at + float(
-            self.config["quota_read_timeout_seconds"]
-        )
+        self.store.state["request_deadline_at"] = started_at + timeout_budget
         self._write_health(
             "reading",
             request_id=request_id,
@@ -1013,13 +1043,13 @@ class QuotaGuard:
         )
         try:
             try:
-                payload = self.client.call(
+                payload = quota_client.call(
                     "account/rateLimits/read", {}, deadline=request_deadline
                 )
             except TypeError as error:
                 if "deadline" not in str(error):
                     raise
-                payload = self.client.call("account/rateLimits/read", {})
+                payload = quota_client.call("account/rateLimits/read", {})
             limits = parse_limits(payload)
             finished_at = self.now()
             self.store.state["quota_read_finished_at"] = finished_at
@@ -1067,8 +1097,8 @@ class QuotaGuard:
             "quota_sequence": self.store.state.get("quota_sequence", 0),
             "primary_last_success_at": self.store.state.get("last_primary_success_at"),
             "secondary_last_success_at": self.store.state.get("last_secondary_success_at"),
-            "primary_data_status": self.store.state.get("primary_data_status", "unknown"),
-            "secondary_data_status": self.store.state.get("secondary_data_status", "unknown"),
+            "primary_data_status": effective_window_status(self.store.state, "primary", self.now()),
+            "secondary_data_status": effective_window_status(self.store.state, "secondary", self.now()),
             "primary_data_expires_at": self.store.state.get("primary_data_expires_at"),
             "secondary_data_expires_at": self.store.state.get("secondary_data_expires_at"),
             "primary_remaining": self.store.state.get("last_primary_remaining"),
@@ -1849,6 +1879,11 @@ class QuotaGuard:
             return 3600.0
         return max(0.0, min(deadlines) - self.now())
 
+    def close(self) -> None:
+        if self.dynamic_tool_client is not None:
+            self.dynamic_tool_client.close()
+            self.dynamic_tool_client = None
+
     def _pending_refresh_message(self, pending: dict[str, Any]) -> str:
         primary = pending.get("primary_remaining")
         secondary = pending.get("secondary_remaining")
@@ -1880,7 +1915,18 @@ class QuotaGuard:
         tool_name = str(params.get("tool") or "")
         if tool_name != "get_usage_limits":
             raise AppServerError(f"不支持的额度守护动态工具：{tool_name}")
-        limits = self.read_limits()
+        # A dynamic-tool request is delivered while the app-server is waiting
+        # for this WebSocket response.  Some managed app-server builds do not
+        # service a nested request on that same connection until the tool
+        # returns, which would make the tool time out even though a normal
+        # quota read works.  Use a short-lived second connection for the local
+        # read in production; lightweight test doubles keep the original path.
+        limits = self.dynamic_tool_limits
+        if limits is None or self.dynamic_tool_limits_at is None:
+            raise AppServerError("额度刷新专用会话尚未准备好有效额度快照")
+        snapshot_age = self.monotonic() - self.dynamic_tool_limits_at
+        if snapshot_age > 60:
+            raise AppServerError("额度刷新专用会话的额度快照已过期")
         snapshot = {
             "primary_remaining_percent": limits.primary_remaining,
             "secondary_remaining_percent": limits.secondary_remaining,
@@ -1895,6 +1941,65 @@ class QuotaGuard:
                 "text": json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
             }],
         }
+
+    def _ensure_refresh_tool_client(self, timeout: float | None = None) -> AppServerClient:
+        """Return a pre-warmed connection reserved for dynamic tool reads."""
+        budget = max(
+            5.0,
+            float(
+                timeout
+                if timeout is not None
+                else self.config.get("scheduled_refresh_read_timeout_seconds", 30)
+            ),
+        )
+        candidate = self.dynamic_tool_client
+        if candidate is not None and (
+            candidate.socket is not None and candidate._connection_error is None
+        ):
+            return candidate
+        if candidate is not None:
+            candidate.close()
+        if not isinstance(self.client, AppServerClient):
+            raise AppServerError("当前额度刷新客户端不支持动态工具连接")
+        candidate = AppServerClient(
+            self.client.executable,
+            self.client.socket_path,
+            request_timeout=budget,
+        )
+        candidate.start(deadline=self.monotonic() + budget)
+        self.dynamic_tool_client = candidate
+        return candidate
+
+    def _prepare_refresh_tool_snapshot(self) -> Limits:
+        """Read a fresh snapshot before starting the model turn.
+
+        The dynamic-tool callback has a short server-side response window.
+        Fetching the quota before ``turn/start`` lets the callback answer from
+        a verified current snapshot even when the upstream usage endpoint is
+        slow.  This remains a local app-server read and does not create a
+        model turn.
+        """
+        timeout = max(
+            5.0,
+            float(self.config.get("scheduled_refresh_read_timeout_seconds", 30)),
+        )
+        if isinstance(self.client, AppServerClient):
+            tool_client = self._ensure_refresh_tool_client(timeout)
+            limits = self.read_limits(
+                client=tool_client,
+                deadline=self.monotonic() + timeout,
+            )
+        else:
+            limits = self.read_limits()
+        if (
+            limits.primary_remaining is None
+            or limits.secondary_remaining is None
+            or limits.primary_resets_at is None
+        ):
+            raise AppServerError("额度刷新接口没有返回完整的当前快照")
+        self.dynamic_tool_limits = limits
+        self.dynamic_tool_limits_at = self.monotonic()
+        return limits
 
     @staticmethod
     def _refresh_dynamic_tools() -> list[dict[str, Any]]:
@@ -2194,6 +2299,27 @@ class QuotaGuard:
             value = value.get("type") or value.get("status")
         return str(value).lower() if value is not None else None
 
+    @staticmethod
+    def _refresh_tool_evidence(turn: dict[str, Any]) -> str:
+        """Return success, failed, or missing evidence for the quota tool."""
+        items = turn.get("items") if isinstance(turn, dict) else None
+        if not isinstance(items, list):
+            return "missing"
+        observed = False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or "").replace("_", "").lower()
+            tool = str(item.get("tool") or item.get("name") or "")
+            if kind != "dynamictoolcall" or tool != "get_usage_limits":
+                continue
+            observed = True
+            if item.get("success") is True and str(item.get("status") or "").lower() in {
+                "completed", "complete", "success", "succeeded"
+            }:
+                return "success"
+        return "failed" if observed else "missing"
+
     def _confirm_submitted_refresh(self, pending: dict[str, Any]) -> bool:
         """Confirm execution evidence for an already accepted refresh turn."""
         target = self._refresh_target(pending)
@@ -2250,6 +2376,26 @@ class QuotaGuard:
         )
         if status not in terminal_statuses and not has_execution_result:
             return False
+        if self.config.get("scheduled_refresh_delivery") == "local_app_server_bridge":
+            tool_evidence = self._refresh_tool_evidence(matched)
+            if tool_evidence != "success":
+                event_name = (
+                    "scheduled_refresh_execution_failed"
+                    if tool_evidence == "failed"
+                    else "scheduled_refresh_execution_missing_tool_evidence"
+                )
+                self.store.event(
+                    event_name,
+                    event_id=pending.get("event_id"),
+                    turn_id=turn_id,
+                    turn_status=status,
+                )
+                self._notify_once(
+                    f"refresh-execution:{pending.get('event_id')}:{tool_evidence}",
+                    "Codex 定时会话未完成额度读取",
+                    "会话 turn 已结束，但没有成功的 get_usage_limits 工具证据；保持待确认，不标记刷新成功",
+                )
+                return False
         pending["status"] = "confirmed"
         pending["execution_confirmed_at"] = int(self.now())
         pending["turn_status"] = status
@@ -2351,6 +2497,25 @@ class QuotaGuard:
             # been accepted by the old target.  Query that original target
             # first, just as the normal exactly-once path requires.
             if not pending.get("conversation_attempted") and not pending.get("conversation_submitted"):
+                if isinstance(self.client, AppServerClient) and not self._dry_run():
+                    try:
+                        # Warm the second connection before turn/start.  The
+                        # app-server gives a dynamic tool only a short window
+                        # to answer, so opening this socket from inside the
+                        # tool callback is too late on a cold launch.
+                        self._prepare_refresh_tool_snapshot()
+                    except (AppServerError, OSError, subprocess.SubprocessError) as error:
+                        self._queue_refresh_retry(
+                            pending,
+                            "refresh_tool_connection_failed",
+                            str(error),
+                        )
+                        self._notify_once(
+                            "refresh-tool-connection-failed",
+                            "Codex 定时会话额度工具不可用",
+                            f"额度工具连接尚未就绪，将按退避重试：{error}",
+                        )
+                        return
                 if self._ensure_refresh_bridge_thread(pending) is None:
                     return
         target = self._retarget_pending_refresh(pending)
@@ -2736,8 +2901,8 @@ class QuotaReader:
             "next_quota_check_at": self.next_quota_check_at,
             "primary_last_success_at": self.state.get("primary_last_success_at"),
             "secondary_last_success_at": self.state.get("secondary_last_success_at"),
-            "primary_data_status": self.state.get("primary_data_status", "unknown"),
-            "secondary_data_status": self.state.get("secondary_data_status", "unknown"),
+            "primary_data_status": effective_window_status(self.state, "primary", self.now()),
+            "secondary_data_status": effective_window_status(self.state, "secondary", self.now()),
             "primary_data_expires_at": self.state.get("primary_data_expires_at"),
             "secondary_data_expires_at": self.state.get("secondary_data_expires_at"),
             "primary_remaining": self.state.get("last_primary_remaining"),
@@ -2811,16 +2976,26 @@ class QuotaReader:
         interval = quota_gradient_interval(remaining, self.config)
         return interval, "critical" if remaining < 10 else "gradient"
 
+    def _read_timeout_seconds(self) -> float:
+        """Return the bounded budget for the isolated real quota reader."""
+        return float(
+            self.config.get(
+                "reader_quota_read_timeout_seconds",
+                self.config["quota_read_timeout_seconds"],
+            )
+        )
+
     def read_once(self) -> Limits:
         started = self.now()
         request_id = str(uuid.uuid4())
-        deadline = self.monotonic() + float(self.config["quota_read_timeout_seconds"])
+        timeout = self._read_timeout_seconds()
+        deadline = self.monotonic() + timeout
         self.state.update({
             "request_in_flight": True,
             "request_id": request_id,
             "request_started_at": started,
             "request_finished_at": None,
-            "request_deadline_at": started + float(self.config["quota_read_timeout_seconds"]),
+            "request_deadline_at": started + timeout,
         })
         self._save()
         self._write_health("reading")
@@ -2916,6 +3091,7 @@ class ActionProcess:
             persist=not bool(self.config.get("dry_run")),
         )
         self.guard = QuotaGuard(client, self.config, self.store, now=now, sleep=sleep)
+        self._restore_observed_limits()
         if self.client is not None:
             try:
                 self.client.dynamic_tool_handler = self.guard._handle_refresh_dynamic_tool
@@ -2935,6 +3111,9 @@ class ActionProcess:
             value = record.get(f"{label}_remaining")
             if isinstance(value, bool):
                 return f"{label}_invalid"
+            declared_status = record.get(f"{label}_data_status")
+            if declared_status is not None and str(declared_status) != "current":
+                return f"{label}_{declared_status}"
             try:
                 numeric = float(value)
             except (TypeError, ValueError):
@@ -2961,6 +3140,116 @@ class ActionProcess:
             {},
         )
 
+    def _mirror_reader_result(self, record: dict[str, Any], validity: str) -> None:
+        """Reflect the reader's per-window evidence in the action health state."""
+        now = self.now()
+        sequence = int(record.get("sequence") or 0)
+        self.store.state["quota_sequence"] = max(
+            int(self.store.state.get("quota_sequence") or 0), sequence
+        )
+        self.store.state["last_error"] = record.get("error")
+        for label in ("primary", "secondary"):
+            value = record.get(f"{label}_remaining")
+            expiry = timestamp_value(record.get(f"{label}_data_expires_at"))
+            declared_status = record.get(f"{label}_data_status")
+            if declared_status is None:
+                value_is_valid = False
+                if value is not None and not isinstance(value, bool):
+                    try:
+                        numeric = float(value)
+                    except (TypeError, ValueError):
+                        numeric = None
+                    value_is_valid = (
+                        numeric is not None
+                        and math.isfinite(numeric)
+                        and 0 <= numeric <= 100
+                    )
+                record_status = (
+                    "current"
+                    if value_is_valid and expiry is not None and now <= expiry
+                    else "expired"
+                    if value_is_valid and expiry is not None
+                    else "invalid"
+                )
+            else:
+                record_status = str(declared_status)
+            if record_status == "current" and expiry is not None:
+                status = "current" if now <= expiry else "expired"
+            elif record_status == "expired" or "expired" in validity:
+                status = "expired"
+            else:
+                status = "invalid"
+            self.store.state[f"{label}_data_status"] = status
+            self.store.state[f"{label}_data_expires_at"] = expiry or now
+            if value is not None and not isinstance(value, bool):
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    numeric = None
+                if numeric is not None and math.isfinite(numeric) and 0 <= numeric <= 100:
+                    self.store.state[f"last_{label}_remaining"] = numeric
+            if status == "current":
+                recorded_at = timestamp_value(record.get("recorded_at"))
+                if recorded_at is not None:
+                    self.store.state[f"last_{label}_success_at"] = recorded_at
+        for label in ("primary", "secondary"):
+            reset_at = record.get(f"{label}_resets_at")
+            if reset_at is not None:
+                self.store.state[f"{label}_resets_at"] = reset_at
+
+    def _remember_reader_result(self, record: dict[str, Any]) -> None:
+        """Persist the newest reader result, including invalid evidence."""
+        self.store.state["last_observed_limits"] = {
+            "primary_remaining": record.get("primary_remaining"),
+            "secondary_remaining": record.get("secondary_remaining"),
+            "primary_resets_at": record.get("primary_resets_at"),
+            "secondary_resets_at": record.get("secondary_resets_at"),
+            "recorded_at": record.get("recorded_at"),
+            "primary_data_status": record.get("primary_data_status"),
+            "secondary_data_status": record.get("secondary_data_status"),
+            "primary_data_expires_at": record.get("primary_data_expires_at"),
+            "secondary_data_expires_at": record.get("secondary_data_expires_at"),
+            "valid": record.get("valid"),
+            "error": record.get("error"),
+        }
+
+    def _restore_observed_limits(self) -> None:
+        """Rehydrate action health from the latest immutable reader snapshot."""
+        observed = self.store.state.get("last_observed_limits")
+        if not isinstance(observed, dict):
+            return
+        record = dict(observed)
+        record.setdefault(
+            "sequence",
+            int(self.store.state.get("last_consumed_quota_sequence") or 0),
+        )
+        record.setdefault("recorded_at", self.store.state.get("updated_at"))
+        for label in ("primary", "secondary"):
+            expiry = timestamp_value(record.get(f"{label}_data_expires_at"))
+            if record.get(f"{label}_data_status") is None:
+                value = record.get(f"{label}_remaining")
+                value_is_valid = False
+                if value is not None and not isinstance(value, bool):
+                    try:
+                        numeric = float(value)
+                    except (TypeError, ValueError):
+                        numeric = None
+                    value_is_valid = (
+                        numeric is not None
+                        and math.isfinite(numeric)
+                        and 0 <= numeric <= 100
+                    )
+                record[f"{label}_data_status"] = (
+                    "current"
+                    if value_is_valid and expiry is not None and self.now() <= expiry
+                    else "expired"
+                    if value_is_valid and expiry is not None
+                    else "invalid"
+                )
+        self._mirror_reader_result(record, "current")
+        self.store.save()
+        self.guard._write_health("actions_restored")
+
     def process_results(self) -> None:
         consumed = int(self.store.state.get("last_consumed_quota_sequence") or 0)
         records = sorted(
@@ -2974,6 +3263,8 @@ class ActionProcess:
             validity = self._record_validity(record)
             limits = self._limits_from_record(record) if validity == "current" else None
             if limits is None:
+                self._mirror_reader_result(record, validity)
+                self._remember_reader_result(record)
                 consumed = sequence
                 self.store.state["last_consumed_quota_sequence"] = sequence
                 self.store.event(
@@ -2993,18 +3284,12 @@ class ActionProcess:
             # therefore inspect the immutable result again after restart.
             self.guard.handle_limits(limits, record=False)
             self.guard._process_fixed_refresh(limits)
+            self._mirror_reader_result(record, validity)
             consumed = sequence
             self.store.state["last_consumed_quota_sequence"] = sequence
-            self.store.state["last_observed_limits"] = {
-                "primary_remaining": limits.primary_remaining,
-                "secondary_remaining": limits.secondary_remaining,
-                "primary_resets_at": limits.primary_resets_at,
-                "secondary_resets_at": limits.secondary_resets_at,
-                "recorded_at": record.get("recorded_at"),
-                "primary_data_expires_at": record.get("primary_data_expires_at"),
-                "secondary_data_expires_at": record.get("secondary_data_expires_at"),
-            }
+            self._remember_reader_result(record)
             self.store.save()
+        self.guard._write_health("actions_results_updated")
 
     def _latest_limits(self) -> Limits | None:
         value = self.store.state.get("last_observed_limits")
@@ -3059,6 +3344,9 @@ class ActionProcess:
                 reconnect_backoff_seconds=max(0.0, remaining),
             )
             self.sleep(min(heartbeat, remaining))
+
+    def close(self) -> None:
+        self.guard.close()
 
 
 class QuotaSupervisor:
@@ -3301,13 +3589,19 @@ class QuotaSupervisor:
             if now - started > grace:
                 return True, "reader 心跳无效"
             return False, "reader 正在启动"
+        request_deadline = health.get("request_deadline_at")
+        deadline_value = timestamp_value(request_deadline)
+        if health.get("request_in_flight"):
+            if deadline_value is not None and now > deadline_value:
+                return True, "额度读取请求超过总期限"
+            # A slow but still bounded request is healthy enough for the
+            # supervisor to wait on.  Its heartbeat is intentionally not
+            # refreshed from a blocked socket call; the deadline is the
+            # authoritative liveness signal while it is in flight.
+            return False, "reader 请求进行中"
         age = now - heartbeat_value
         if age > grace:
             return True, f"reader 心跳过期 {age:.1f}s"
-        request_deadline = health.get("request_deadline_at")
-        deadline_value = timestamp_value(request_deadline)
-        if health.get("request_in_flight") and deadline_value is not None and now > deadline_value:
-            return True, "额度读取请求超过总期限"
         return False, "healthy"
 
     def _worker_is_stale(self) -> tuple[bool, str]:
@@ -3489,7 +3783,12 @@ def main(argv: list[str] | None = None) -> int:
         client = AppServerClient(
             executable,
             str(config["app_server_socket"]),
-            request_timeout=float(config["quota_read_timeout_seconds"]),
+            request_timeout=float(
+                config.get(
+                    "reader_quota_read_timeout_seconds",
+                    config["quota_read_timeout_seconds"],
+                )
+            ),
         )
         reader = QuotaReader(client, config)
         try:
@@ -3512,6 +3811,7 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             return 0
         finally:
+            actions.close()
             client.close()
         return 0
 
@@ -3548,6 +3848,7 @@ def main(argv: list[str] | None = None) -> int:
         store.event("fatal_error", error=str(error))
         return 1
     finally:
+        guard.close()
         client.close()
     return 0
 
