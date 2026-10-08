@@ -23,6 +23,8 @@
   "show_dock_icon": true,
   "notify_desktop": true,
   "scheduled_refresh_thread_id": "",
+  "scheduled_refresh_delivery": "local_app_server_bridge",
+  "scheduled_refresh_cwd": "",
   "scheduled_refresh_enabled": true,
   "scheduled_refresh_hours": [7, 12, 17, 22],
   "scheduled_refresh_hour_shift": 0,

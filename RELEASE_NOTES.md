@@ -1,3 +1,9 @@
+# Codex Quota Guard 1.0 — Build 22
+
+- Build 22：定时刷新专用会话通过 app-server experimental dynamic tool 实际调用本地 `get_usage_limits`，修复会话缺少 MCP 时只回复“接口不可用”的问题；旧 bridge 会在空闲后自动升级到带工具能力的新会话。新增原生 Goal 暂停/恢复：暂停时验证 Goal `paused` 与当前 turn 已结束，恢复时验证 Goal `active`；能力缺失时不伪报成功。
+- Build 21：定时刷新不再委托给无法由本地 APP 调用的 Codex automation。新增本地 app-server bridge，自动创建/复用专用桌面会话，真实提交刷新消息并持久化 thread/turn 结果；兼容旧 `codex_automation` 配置。
+- 兼容当前 managed app-server 不支持 `thread/read(includeTurns=true)` 的情况：使用 turn 完成通知和线程状态确认，不把“消息已委托”冒充为已发送。
+
 # Codex Quota Guard 1.0 — Build 15
 
 - Build 15：将额度读取、阈值动作和监督拆为三个独立职责。读取进程使用统一的 5 秒单调总期限、梯度兜底和只追加额度结果；动作进程按序号消费并保留未核对操作；监督进程独立检查心跳、请求期限、窗口数据过期并仅限流重启读取进程。定时会话改为持久化事件集合，提交超时先查询，不因新时点覆盖旧记录。设置界面分别显示读取、动作和监督健康。Build 15 不自动安装、提交、发布或操作真实任务。

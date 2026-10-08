@@ -4,7 +4,7 @@
 
 额度检测有三层护栏：额度事件到达时立即读取；事件丢失时，按两个窗口中较低的有效余量使用梯度间隔本地读取；独立监督进程每 5 秒检查读取进程、动作进程、心跳、读取请求期限和两个窗口的数据期限。默认曲线锚点为：100% 读一次后等待 600 秒、90% 等待 500 秒、20% 等待 200 秒、19% 等待 90 秒、10% 等待 10 秒，低于 10% 固定每 5 秒读取。一次读取超时默认 5 秒，因此事件丢失时的最大检测延迟约为：100% 时 605 秒、90% 时 505 秒、20% 时 205 秒、19% 时 95 秒、10% 时 15 秒、低于 10% 时 10 秒。任一窗口数据无效时使用 5 秒安全间隔。兜底读取只调用本地额度接口，不启动模型 turn。
 
-默认策略是：5 小时余量低于 `primary_warning_percent` 时，枚举未归档且确实处于 active 的任务，对每个当前进行中的 turn 调用原生 `turn/interrupt`，并读取线程确认已经停止；重置时间到达后再等待 `post_reset_delay_seconds`，向本轮成功停止的线程发送配置中的继续消息，并再次确认进入进行中状态。总额度低于 `secondary_warning_percent` 时，若有可用重置卡，调用 Codex 原生 `account/rateLimitResetCredit/consume`；没有可用卡或调用失败会写入事件日志并弹出通知，不会假装成功。
+默认策略是：5 小时余量低于 `primary_warning_percent` 时，枚举未归档且确实处于 active 的任务。普通 turn 调用原生 `turn/interrupt` 并读取线程确认已经停止；检测到原生 Goal 时先调用 `thread/goal/set(status=paused)`，再中止当前 turn，并同时验证 Goal 已 paused、turn 已结束，才加入恢复名单。重置时间到达后再等待 `post_reset_delay_seconds`；Goal 通过 `thread/goal/set(status=active)` 恢复并验证，普通 turn 才发送配置中的继续消息。Goal 控制接口缺失或验证不确定时保持未确认，不把普通消息、归档或 handoff 冒充 Goal 暂停。总额度低于 `secondary_warning_percent` 时，若有可用重置卡，调用 Codex 原生 `account/rateLimitResetCredit/consume`；没有可用卡或调用失败会写入事件日志并弹出通知，不会假装成功。
 
 ## 使用
 
@@ -36,7 +36,9 @@
 
 ## 后台启动
 
-`scheduled_refresh_thread_id` 指定定时消息的目标 Codex 对话。配置后，到点会发送真实会话请求，让 Codex 调用 `get_usage_limits` 并回复五小时额度。正在执行的对话会等到空闲再发送；请求超时或返回不明确时记录待确认，避免重复启动。该会话会使用少量模型额度，桌面通知作为附加提醒。此设置不会调用 bank reset。
+定时刷新默认使用 `local_app_server_bridge`：到点后守护程序通过本机 Codex managed app-server 创建或复用一个自己管理的持久会话，并在 `thread/start` 时注册本地动态 `get_usage_limits` 工具，再实际提交一条用户消息。会话会真实调用该工具，额度由守护程序通过 `account/rateLimits/read` 返回；它不依赖会话自身的 MCP，也不会把系统通知当作会话已发送。由于动态工具属于 app-server experimental capability，客户端会在 `initialize` 中显式声明 `experimentalApi`。`scheduled_refresh_cwd` 可指定新会话的工作目录，留空时使用守护程序脚本所在目录；`scheduled_refresh_thread_id` 只作为显式 `local_app_server` 模式的目标。旧配置的 `codex_automation` 会在内存中自动迁移到 bridge，不再只记录“已委托”而不发送消息，也不会调用独立 automation。
+
+提交记录包含 thread ID、turn ID 和受理/完成状态。当前 managed app-server 若不支持 `thread/read(includeTurns=true)`，守护程序会退回到不带 turns 的线程状态，并使用 `turn/completed` 通知确认；没有确认前不会标记定时会话成功。该会话会使用少量模型额度，桌面通知只是附加提醒。此设置不会调用 bank reset。
 
 `LaunchAgent.template.plist` 是模板；需要启用新版后台时运行 `./install_quota_guard.sh`。脚本会使用当前 `python3` 的绝对路径，备份旧 LaunchAgent、配置、状态和已安装 APP，再用 `--supervise` 加载并确认 `reader-health.json`、`actions-health.json`、`watchdog.json` 的 PID、实例、配置版本和新鲜心跳；若确认超时，会卸载本次新服务并恢复备份的 LaunchAgent 与 APP。模板启动的是 `--supervise`：监督进程只管理自己创建的读取进程和动作进程；读取进程 10 分钟内最多自动重启 3 次，随后暂停重启 10 分钟，避免重启风暴。动作进程异常只报警并保留未核对动作，不自动重放。若只想暂时运行，可直接使用 `python3 codex_quota_guard.py --config config.json --worker`；`--worker` 只是兼容入口，会映射到完整监督结构。
 

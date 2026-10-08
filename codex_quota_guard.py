@@ -41,6 +41,7 @@ TERMINAL_THREAD_STATUSES = {"idle", "completed", "archived"}
 RESUME_TERMINAL_STATUSES = {"completed", "archived"}
 UNKNOWN_THREAD_STATUSES = {"notLoaded", "loading"}
 SHARED_SUPPORT_DIR = pathlib.Path.home() / "Library/Application Support/CodexQuotaGuard"
+REFRESH_BRIDGE_CAPABILITY_VERSION = 1
 
 
 def default_state() -> dict[str, Any]:
@@ -53,6 +54,9 @@ def default_state() -> dict[str, Any]:
         "fixed_refresh_schedule_signature": None,
         "pending_scheduled_refresh": None,
         "pending_scheduled_refresh_events": [],
+        "scheduled_refresh_bridge_thread_id": None,
+        "scheduled_refresh_bridge_created_at": None,
+        "scheduled_refresh_bridge_capability_version": None,
         "last_consumed_quota_sequence": 0,
         "last_observed_limits": None,
         "action_instance_id": None,
@@ -365,6 +369,11 @@ def merged_config(value: dict[str, Any]) -> dict[str, Any]:
         "scheduled_refresh_thread_id": "",
         "dry_run": False,
         "scheduled_refresh_enabled": True,
+        "scheduled_refresh_delivery": "local_app_server_bridge",
+        # launchd starts the service without the repository as its cwd (often
+        # "/").  Use the guard's own directory unless the user configured a
+        # dedicated read-only workspace explicitly.
+        "scheduled_refresh_cwd": str(pathlib.Path(__file__).resolve().parent),
         "scheduled_refresh_hours": [7, 12, 17, 22],
         "scheduled_refresh_hour_shift": 0,
         "scheduled_refresh_offset_seconds": 60,
@@ -386,6 +395,24 @@ def merged_config(value: dict[str, Any]) -> dict[str, Any]:
     }
     defaults.update(raw_value)
     defaults["scheduled_refresh_enabled"] = True
+    delivery_value = value.get("scheduled_refresh_delivery")
+    if delivery_value is None and value.get("scheduled_refresh_thread_id"):
+        # Preserve the pre-bridge meaning of an explicitly configured target
+        # thread.  New configurations without a target use the guard-owned
+        # local bridge automatically.
+        delivery_value = "local_app_server"
+    delivery = str(delivery_value or defaults["scheduled_refresh_delivery"])
+    if delivery not in {"local_app_server", "local_app_server_bridge", "codex_automation"}:
+        raise ValueError(
+            "scheduled_refresh_delivery 必须是 local_app_server、local_app_server_bridge 或 codex_automation"
+        )
+    # Older installations used a Codex-native automation as the sender.  The
+    # standalone guard cannot invoke that MCP surface, so transparently move
+    # the delivery responsibility to a persistent local app-server thread.
+    if delivery == "codex_automation":
+        defaults["scheduled_refresh_delivery_migrated_from"] = delivery
+        delivery = "local_app_server_bridge"
+    defaults["scheduled_refresh_delivery"] = delivery
     defaults["force_stop_active_turns"] = True
     for key in ("primary_warning_percent", "secondary_warning_percent"):
         number = float(defaults[key])
@@ -490,6 +517,21 @@ class AppServerError(RuntimeError):
     pass
 
 
+class AppServerMethodError(AppServerError):
+    """A JSON-RPC method returned an application-level error."""
+
+    def __init__(self, method: str, error: Any):
+        self.method = method
+        self.error = error if isinstance(error, dict) else {"message": str(error)}
+        self.code = self.error.get("code")
+        self.message = str(self.error.get("message") or self.error)
+        super().__init__(f"{method} 失败: {self.error}")
+
+    @property
+    def is_active_writer(self) -> bool:
+        return self.code == -32600 and "active writer" in self.message.lower()
+
+
 class ResultPublicationError(OSError):
     """The quota read completed but its immutable result could not be published."""
 
@@ -513,6 +555,8 @@ class AppServerClient:
         self._next_id = 1
         self._responses: dict[int, dict[str, Any]] = {}
         self._notifications: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._turn_completions: dict[tuple[str, str], dict[str, Any]] = {}
+        self.dynamic_tool_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
         self._connection_error: Exception | None = None
         self._closing = False
         self._connection_generation = 0
@@ -555,7 +599,11 @@ class AppServerClient:
                             "name": "codex-quota-guard",
                             "title": "Codex Quota Guard",
                             "version": "1.1.0",
-                        }
+                        },
+                        # Dynamic tools are an experimental app-server
+                        # capability.  Without this opt-in, thread/start
+                        # rejects the tool list before a refresh turn exists.
+                        "capabilities": {"experimentalApi": True},
                     },
                     deadline=deadline,
                     _skip_start=True,
@@ -679,10 +727,24 @@ class AppServerClient:
                 if self.socket is not sock or self._connection_generation != generation:
                     continue
                 with self._condition:
-                    if isinstance(message.get("id"), int):
+                    if message.get("id") is not None and message.get("method"):
+                        handler = self.dynamic_tool_handler
+                        threading.Thread(
+                            target=self._handle_server_request,
+                            args=(message, sock, generation, handler),
+                            daemon=True,
+                        ).start()
+                    elif isinstance(message.get("id"), int):
                         self._responses[message["id"]] = message
                         self._condition.notify_all()
                     elif message.get("method"):
+                        if message.get("method") == "turn/completed":
+                            params = message.get("params") or {}
+                            turn = params.get("turn") or {}
+                            thread_id = params.get("threadId")
+                            turn_id = turn.get("id") if isinstance(turn, dict) else None
+                            if thread_id and turn_id:
+                                self._turn_completions[(str(thread_id), str(turn_id))] = turn
                         self._notifications.put(message)
                         self._condition.notify_all()
         except Exception as error:
@@ -690,6 +752,50 @@ class AppServerClient:
                 with self._condition:
                     self._connection_error = error
                     self._condition.notify_all()
+
+    def _handle_server_request(
+        self,
+        message: dict[str, Any],
+        sock: socket.socket,
+        generation: int,
+        handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
+    ) -> None:
+        """Answer app-server requests without blocking the WebSocket reader.
+
+        Dynamic tools are server-to-client JSON-RPC requests.  The handler may
+        need to issue a nested app-server request (for example the quota read),
+        so it must run on a separate thread rather than inside ``_read_loop``.
+        """
+        request_id = message.get("id")
+        method = str(message.get("method") or "")
+        params = message.get("params")
+        params = params if isinstance(params, dict) else {}
+        try:
+            if handler is None:
+                raise AppServerError("当前客户端未注册动态工具处理器")
+            result = handler(method, params)
+            response: dict[str, Any] = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": result,
+            }
+        except Exception as error:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": str(error),
+                },
+            }
+        try:
+            if self.socket is sock and self._connection_generation == generation:
+                self._send_frame(
+                    json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode(),
+                    sock=sock,
+                )
+        except (OSError, AppServerError):
+            pass
 
     def _send_notification(
         self,
@@ -730,7 +836,7 @@ class AppServerClient:
                 self._condition.wait(timeout=remaining)
             response = self._responses.pop(request_id)
         if "error" in response:
-            raise AppServerError(f"{method} 失败: {response['error']}")
+            raise AppServerMethodError(method, response["error"])
         return response.get("result") or {}
 
     def start_if_needed(self, deadline: float | None = None) -> None:
@@ -758,6 +864,29 @@ class AppServerClient:
                     return None
                 self._condition.wait(timeout=remaining)
 
+    def wait_for_turn_completion(
+        self,
+        thread_id: str,
+        turn_id: str,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        """Return a completion notification without requiring list_turns support."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        key = (str(thread_id), str(turn_id))
+        with self._condition:
+            while True:
+                completed = self._turn_completions.pop(key, None)
+                if completed is not None:
+                    return completed
+                if self._connection_error:
+                    raise AppServerError(
+                        f"等待 turn/{turn_id} 完成时连接断开: {self._connection_error}"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(timeout=remaining)
+
     def close(self) -> None:
         self._closing = True
         socket_to_close = self.socket
@@ -765,6 +894,7 @@ class AppServerClient:
         self._connection_generation += 1
         with self._condition:
             self._responses.clear()
+            self._turn_completions.clear()
             self._condition.notify_all()
         if socket_to_close is not None:
             try:
@@ -1049,10 +1179,25 @@ class QuotaGuard:
             if not cursor:
                 return data
 
-    def read_thread(self, thread_id: str) -> dict[str, Any]:
-        result = self.client.call(
-            "thread/read", {"threadId": thread_id, "includeTurns": True}
-        )
+    def read_thread(self, thread_id: str, include_turns: bool = True) -> dict[str, Any]:
+        params: dict[str, Any] = {"threadId": thread_id}
+        if include_turns:
+            params["includeTurns"] = True
+        try:
+            result = self.client.call("thread/read", params)
+        except AppServerMethodError as error:
+            # Current managed desktop app-server builds expose thread state
+            # but may not implement the paginated list_turns backend.  The
+            # caller can still use turn/completed notifications for delivery
+            # confirmation; task-control callers must treat missing turns as
+            # unverified and therefore must not interrupt or resume blindly.
+            if include_turns and "list_turns is not supported" in error.message.lower():
+                result = self.client.call("thread/read", {"threadId": thread_id})
+                thread = result.get("thread") or {}
+                if isinstance(thread, dict):
+                    thread["_turns_unavailable"] = True
+                return thread
+            raise
         return result.get("thread") or {}
 
     def notify(self, title: str, message: str) -> bool:
@@ -1144,6 +1289,46 @@ class QuotaGuard:
                 return True
         return False
 
+    def _goal_control_capable(self, thread: dict[str, Any]) -> bool:
+        """Return whether this client can make native goal requests.
+
+        Production uses ``AppServerClient``.  The explicit test-double hook
+        keeps unit tests honest without forcing ordinary fake clients to
+        implement an experimental protocol method they are not testing.
+        """
+        return isinstance(self.client, AppServerClient) or bool(
+            getattr(self.client, "supports_goal_control", False)
+        )
+
+    def _read_goal(self, thread_id: str, thread: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+        """Read native goal state, returning (goal, protocol_supported)."""
+        if not self._goal_control_capable(thread) and not self._goal_evidence(thread):
+            return None, False
+        try:
+            result = self.client.call("thread/goal/get", {"threadId": thread_id})
+        except AppServerMethodError as error:
+            if error.code == -32601 or "method not found" in error.message.lower():
+                return None, False
+            raise
+        goal = result.get("goal") if isinstance(result, dict) else None
+        return (goal if isinstance(goal, dict) else None), True
+
+    @staticmethod
+    def _goal_status(goal: dict[str, Any] | None) -> str | None:
+        if not isinstance(goal, dict):
+            return None
+        value = goal.get("status")
+        return str(value).lower() if value is not None else None
+
+    def _verify_goal_status(self, thread_id: str, expected: str) -> bool:
+        deadline = self.now() + 10
+        while self.now() <= deadline:
+            goal, supported = self._read_goal(thread_id, {})
+            if supported and self._goal_status(goal) == expected:
+                return True
+            self.sleep(0.25)
+        return False
+
     def force_stop_active_threads(self, reset_at: int) -> int:
         stopped_count = 0
         excluded = set(self.config.get("exclude_thread_ids") or [])
@@ -1151,12 +1336,85 @@ class QuotaGuard:
             thread_id = listed.get("id")
             if not thread_id or thread_id in excluded or not is_candidate_thread(listed):
                 continue
+            turn_id: str | None = None
             try:
                 thread, turn_id = self._active_turn(listed)
-                if not turn_id:
+                goal, goal_api_supported = self._read_goal(thread_id, thread)
+                goal_status = self._goal_status(goal)
+                goal_is_active = goal_status == "active" or (
+                    not goal_api_supported and self._goal_evidence(thread)
+                )
+                if goal_status == "paused":
+                    # A goal paused by the user or another controller is not
+                    # ours to resume later.  Do not interrupt a turn under it
+                    # and accidentally claim ownership of the pause episode.
+                    self.store.event("goal_already_paused_not_owned", thread_id=thread_id)
+                    continue
+                if goal_is_active and not goal_api_supported:
                     self.store.event(
-                        "active_thread_without_verified_turn", thread_id=thread_id,
+                        "goal_control_unavailable",
+                        thread_id=thread_id,
                         title=thread.get("name") if isinstance(thread, dict) else None,
+                    )
+                    self._notify_once(
+                        f"goal-control-unavailable:{reset_at}:{thread_id}",
+                        "Codex 额度保护受限",
+                        f"任务 {thread_id} 检测到 Goal，但当前接口没有可验证的原生 Goal 暂停控制",
+                    )
+                    continue
+                if not turn_id:
+                    if goal_is_active:
+                        self.store.event(
+                            "active_goal_without_verified_turn",
+                            thread_id=thread_id,
+                            title=thread.get("name") if isinstance(thread, dict) else None,
+                        )
+                    else:
+                        self.store.event(
+                            "active_thread_without_verified_turn", thread_id=thread_id,
+                            title=thread.get("name") if isinstance(thread, dict) else None,
+                        )
+                    if goal_status == "paused":
+                        self.store.event("goal_already_paused_not_owned", thread_id=thread_id)
+                    if not goal_is_active:
+                        continue
+                    key = self._stop_attempt_key(reset_at, thread_id, "goal")
+                    attempt = (self.store.state.setdefault("stop_attempts", {})).get(key) or {}
+                    if attempt.get("status") == "verified" or int(attempt.get("next_retry_at") or 0) > int(self.now()):
+                        continue
+                    if self._dry_run():
+                        self.store.event("would_pause_goal", thread_id=thread_id)
+                        continue
+                    self.client.call(
+                        "thread/goal/set", {"threadId": thread_id, "status": "paused"}
+                    )
+                    if not self._verify_goal_status(thread_id, "paused"):
+                        self._record_stop_failure(key, "设置 Goal 暂停后无法确认状态")
+                        self.store.save()
+                        self.store.event("goal_pause_verification_failed", thread_id=thread_id)
+                        continue
+                    self.store.state.setdefault("stop_attempts", {})[key] = {
+                        "status": "verified",
+                        "attempts": int(attempt.get("attempts") or 0) + 1,
+                        "last_attempt_at": int(self.now()),
+                    }
+                    self.store.state["paused_threads"][thread_id] = {
+                        "thread_id": thread_id,
+                        "turn_id": None,
+                        "title": thread.get("name") or thread.get("preview") or thread_id,
+                        "cwd": thread.get("cwd"),
+                        "reset_at": reset_at,
+                        "goal_paused_verified": True,
+                        "goal_objective": goal.get("objective") if isinstance(goal, dict) else None,
+                    }
+                    self.store.save()
+                    self.store.event(
+                        "goal_pause_verified", thread_id=thread_id, reset_at=reset_at
+                    )
+                    stopped_count += 1
+                    self.notify("Codex 额度保护", f"已暂停 Goal：{thread.get('name') or thread_id}")
+                    self.store.event(
+                        "forced_stop_verified", thread_id=thread_id, turn_id=None, reset_at=reset_at
                     )
                     continue
                 key = self._stop_attempt_key(reset_at, thread_id, turn_id)
@@ -1166,8 +1424,21 @@ class QuotaGuard:
                 if int(attempt.get("next_retry_at") or 0) > int(self.now()):
                     continue
                 if self._dry_run():
+                    if goal_is_active:
+                        self.store.event("would_pause_goal", thread_id=thread_id)
                     self.store.event("would_interrupt", thread_id=thread_id, turn_id=turn_id)
                     continue
+                if goal_is_active:
+                    self.client.call(
+                        "thread/goal/set", {"threadId": thread_id, "status": "paused"}
+                    )
+                    if not self._verify_goal_status(thread_id, "paused"):
+                        self._record_stop_failure(key, "设置 Goal 暂停后无法确认状态")
+                        self.store.save()
+                        self.store.event(
+                            "goal_pause_verification_failed", thread_id=thread_id, turn_id=turn_id
+                        )
+                        continue
                 self.client.call(
                     "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
                 )
@@ -1176,6 +1447,13 @@ class QuotaGuard:
                     self.store.save()
                     self.store.event(
                         "interrupt_verification_failed", thread_id=thread_id, turn_id=turn_id
+                    )
+                    continue
+                if goal_is_active and not self._verify_goal_status(thread_id, "paused"):
+                    self._record_stop_failure(key, "中断后 Goal 状态未保持 paused")
+                    self.store.save()
+                    self.store.event(
+                        "goal_pause_verification_failed", thread_id=thread_id, turn_id=turn_id
                     )
                     continue
                 self.store.state.setdefault("stop_attempts", {})[key] = {
@@ -1189,13 +1467,20 @@ class QuotaGuard:
                     "title": thread.get("name") or thread.get("preview") or thread_id,
                     "cwd": thread.get("cwd"),
                     "reset_at": reset_at,
+                    "goal_paused_verified": bool(goal_is_active),
+                    "goal_objective": goal.get("objective") if isinstance(goal, dict) else None,
                 }
                 self.store.save()
                 self.store.event(
-                    "forced_stop_verified", thread_id=thread_id, turn_id=turn_id, reset_at=reset_at
+                    "goal_pause_and_turn_stop_verified" if goal_is_active else "forced_stop_verified",
+                    thread_id=thread_id, turn_id=turn_id, reset_at=reset_at,
                 )
                 stopped_count += 1
-                self.notify("Codex 额度保护", f"已强制停止：{thread.get('name') or thread_id}")
+                self.notify(
+                    "Codex 额度保护",
+                    f"已暂停 Goal 并强制停止当前 turn：{thread.get('name') or thread_id}"
+                    if goal_is_active else f"已强制停止：{thread.get('name') or thread_id}",
+                )
             except AppServerError as error:
                 self._record_stop_failure(
                     self._stop_attempt_key(reset_at, thread_id, turn_id or "unknown"), str(error)
@@ -1215,8 +1500,13 @@ class QuotaGuard:
         messages = self.config.get("resume_messages") or {}
         return str(messages.get(thread_id) or DEFAULT_RESUME_MESSAGE)
 
-    def _verify_started(self, thread_id: str, expected_turn_id: str | None = None) -> tuple[bool, bool]:
-        deadline = self.now() + 10
+    def _verify_started(
+        self,
+        thread_id: str,
+        expected_turn_id: str | None = None,
+        timeout: float = 10,
+    ) -> tuple[bool, bool]:
+        deadline = self.now() + max(0.1, float(timeout))
         while self.now() <= deadline:
             thread = self.read_thread(thread_id)
             if isinstance(thread, dict) and thread:
@@ -1303,6 +1593,57 @@ class QuotaGuard:
                     if status == "notLoaded":
                         self._resume_failure(record, "任务仍处于 notLoaded")
                         continue
+                if record.get("goal_paused_verified"):
+                    goal, goal_api_supported = self._read_goal(thread_id, thread)
+                    goal_status = self._goal_status(goal)
+                    if not goal_api_supported:
+                        self._resume_failure(record, "原生 Goal 恢复接口不可用")
+                        continue
+                    if goal_status == "active":
+                        self.store.event("resume_skipped_goal_already_active", thread_id=thread_id)
+                        self.store.state["paused_threads"].pop(thread_id, None)
+                        continue
+                    if goal_status in {"complete", "blocked", "usageLimited", "budgetLimited"} or goal is None:
+                        self.store.event(
+                            "resume_skipped_goal_terminal_or_missing",
+                            thread_id=thread_id,
+                            status=goal_status,
+                        )
+                        self.store.state["paused_threads"].pop(thread_id, None)
+                        continue
+                    if goal_status != "paused":
+                        self._resume_failure(record, f"Goal 状态不明确：{goal_status or 'unknown'}")
+                        continue
+                    if self._dry_run():
+                        self.store.event("would_resume_goal", thread_id=thread_id, reset_at=reset_at)
+                        continue
+                    self.client.call(
+                        "thread/goal/set", {"threadId": thread_id, "status": "active"}
+                    )
+                    if not self._verify_goal_status(thread_id, "active"):
+                        self._resume_failure(record, "恢复 Goal 后无法确认 active 状态")
+                        self.store.event("goal_resume_verification_failed", thread_id=thread_id)
+                        continue
+                    turn_verified, _ = self._verify_started(thread_id, timeout=5)
+                    self.store.state["paused_threads"].pop(thread_id, None)
+                    record["resume_attempts"] = 0
+                    record.pop("next_resume_retry_at", None)
+                    self.store.save()
+                    self.store.event(
+                        "resume_verified_goal_native",
+                        thread_id=thread_id,
+                        reset_at=reset_at,
+                        turn_active=turn_verified,
+                    )
+                    self.notify(
+                        "Codex 额度保护",
+                        (
+                            f"额度已重置，已恢复 Goal 并确认自动续跑：{record.get('title') or thread_id}"
+                            if turn_verified
+                            else f"额度已重置，Goal 状态已恢复，但自动续跑尚未确认：{record.get('title') or thread_id}"
+                        ),
+                    )
+                    continue
                 if in_progress_turn_id(thread):
                     self.store.event("resume_skipped_already_active", thread_id=thread_id)
                     self.store.state["paused_threads"].pop(thread_id, None)
@@ -1517,8 +1858,287 @@ class QuotaGuard:
         prefix = f"已合并补发，错过 {missed} 个定时点；" if missed else ""
         return f"{prefix}已刷新：5 小时剩余 {primary_text}，总额度剩余 {secondary_text}"
 
+    def _refresh_target(self, pending: dict[str, Any] | None = None) -> str:
+        if pending:
+            target = pending.get("target_thread_id")
+            if target:
+                return str(target)
+        if self.config.get("scheduled_refresh_delivery") == "local_app_server_bridge":
+            bridge_id = self.store.state.get("scheduled_refresh_bridge_thread_id")
+            if bridge_id:
+                return str(bridge_id)
+        return str(self.config.get("scheduled_refresh_thread_id") or "")
+
+    def _handle_refresh_dynamic_tool(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Expose the local quota read as a real tool inside the bridge turn."""
+        if method != "item/tool/call":
+            raise AppServerError(f"不支持的 app-server 请求：{method}")
+        tool_name = str(params.get("tool") or "")
+        if tool_name != "get_usage_limits":
+            raise AppServerError(f"不支持的额度守护动态工具：{tool_name}")
+        limits = self.read_limits()
+        snapshot = {
+            "primary_remaining_percent": limits.primary_remaining,
+            "secondary_remaining_percent": limits.secondary_remaining,
+            "primary_resets_at": limits.primary_resets_at,
+            "secondary_resets_at": limits.secondary_resets_at,
+            "reset_credit_count": limits.reset_credit_count,
+        }
+        return {
+            "success": True,
+            "contentItems": [{
+                "type": "inputText",
+                "text": json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+            }],
+        }
+
+    @staticmethod
+    def _refresh_dynamic_tools() -> list[dict[str, Any]]:
+        return [{
+            "type": "function",
+            "name": "get_usage_limits",
+            "description": (
+                "读取当前 Codex 五小时和总额度窗口。必须使用返回的百分比和 Unix "
+                "重置时间回答，不执行 bank reset、任务控制或设置修改。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        }]
+
+    @staticmethod
+    def _thread_id_from_start_result(result: dict[str, Any]) -> str | None:
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if isinstance(thread, dict) and thread.get("id"):
+            return str(thread["id"])
+        for key in ("threadId", "thread_id", "id"):
+            value = result.get(key) if isinstance(result, dict) else None
+            if value:
+                return str(value)
+        return None
+
+    def _ensure_refresh_bridge_thread(self, pending: dict[str, Any]) -> str | None:
+        """Create or reuse the guard-owned desktop Codex conversation.
+
+        The previous ``codex_automation`` mode only recorded a delegation; it
+        never submitted a message from this process.  This bridge owns one
+        persistent local app-server thread instead.  Keeping the client open
+        for the lifetime of the action process lets the submitted turn finish
+        and be queried before the scheduled event is acknowledged.
+        """
+        bridge_id = self.store.state.get("scheduled_refresh_bridge_thread_id")
+        upgrade_required = bool(
+            bridge_id
+            and self.store.state.get("scheduled_refresh_bridge_capability_version")
+            != REFRESH_BRIDGE_CAPABILITY_VERSION
+        )
+        if bridge_id:
+            try:
+                thread = self.read_thread(str(bridge_id))
+            except AppServerMethodError as error:
+                message = error.message.lower()
+                if "not found" not in message and "not loaded" not in message:
+                    self._queue_refresh_retry(pending, "refresh_bridge_thread_read_failed", str(error))
+                    return None
+                self.store.state["scheduled_refresh_bridge_thread_id"] = None
+                self.store.state["scheduled_refresh_bridge_created_at"] = None
+                self.store.state["scheduled_refresh_bridge_capability_version"] = None
+                self.store.event(
+                    "refresh_bridge_thread_unavailable",
+                    thread_id=bridge_id,
+                    error=str(error),
+                )
+                self.store.save()
+            except AppServerError as error:
+                self._queue_refresh_retry(pending, "refresh_bridge_thread_read_failed", str(error))
+                return None
+            else:
+                status = (thread.get("status") or {}).get("type")
+                if status in ACTIVE_THREAD_STATUSES:
+                    pending["next_retry_at"] = int(self.now()) + 60
+                    self.store.event(
+                        "refresh_bridge_thread_busy",
+                        thread_id=bridge_id,
+                        status=status,
+                        retry_at=pending["next_retry_at"],
+                    )
+                    self.store.save()
+                    return None
+                if status in {"idle", "notLoaded"}:
+                    if not upgrade_required:
+                        return str(bridge_id)
+                    old_bridge_id = bridge_id
+                    self.store.state["scheduled_refresh_bridge_thread_id"] = None
+                    self.store.state["scheduled_refresh_bridge_created_at"] = None
+                    self.store.state["scheduled_refresh_bridge_capability_version"] = None
+                    self.store.event(
+                        "refresh_bridge_thread_upgrade_required",
+                        thread_id=old_bridge_id,
+                        capability_version=REFRESH_BRIDGE_CAPABILITY_VERSION,
+                    )
+                    self.store.save()
+                    bridge_id = None
+                else:
+                    self.store.state["scheduled_refresh_bridge_thread_id"] = None
+                    self.store.state["scheduled_refresh_bridge_created_at"] = None
+                    self.store.state["scheduled_refresh_bridge_capability_version"] = None
+                    self.store.event(
+                        "refresh_bridge_thread_replaced",
+                        thread_id=bridge_id,
+                        status=status,
+                    )
+                    self.store.save()
+
+        if self._dry_run():
+            self.store.event("would_create_refresh_bridge_thread")
+            return "dry-run-refresh-bridge"
+
+        cwd = pathlib.Path(
+            str(
+                self.config.get("scheduled_refresh_cwd")
+                or pathlib.Path(__file__).resolve().parent
+            )
+        ).expanduser()
+        params = {
+            "cwd": str(cwd),
+            "ephemeral": False,
+            "sandbox": "read-only",
+            "approvalPolicy": "never",
+            "dynamicTools": self._refresh_dynamic_tools(),
+        }
+        try:
+            result = self.client.call("thread/start", params)
+        except (AppServerError, OSError) as error:
+            self._queue_refresh_retry(pending, "refresh_bridge_thread_create_failed", str(error))
+            self._notify_once(
+                "refresh-bridge-create-failed",
+                "Codex 定时会话不可用",
+                f"无法创建额度刷新专用会话，将按退避重试：{error}",
+            )
+            return None
+        thread_id = self._thread_id_from_start_result(result)
+        if not thread_id:
+            error = "thread/start 返回中没有 thread id"
+            self._queue_refresh_retry(pending, "refresh_bridge_thread_create_failed", error)
+            self._notify_once(
+                "refresh-bridge-create-failed",
+                "Codex 定时会话不可用",
+                error,
+            )
+            return None
+        self.store.state["scheduled_refresh_bridge_thread_id"] = thread_id
+        self.store.state["scheduled_refresh_bridge_created_at"] = int(self.now())
+        self.store.state["scheduled_refresh_bridge_capability_version"] = REFRESH_BRIDGE_CAPABILITY_VERSION
+        self.store.event(
+            "refresh_bridge_thread_created",
+            thread_id=thread_id,
+            cwd=str(cwd),
+        )
+        self.store.save()
+        return thread_id
+
+    def _retarget_pending_refresh(self, pending: dict[str, Any]) -> str:
+        """Bind an unsubmitted event to the currently configured refresh session."""
+        target = self._refresh_target()
+        if not target:
+            return self._refresh_target(pending)
+        previous = pending.get("target_thread_id")
+        if previous == target:
+            return target
+        if pending.get("conversation_submitted") or pending.get("conversation_attempted"):
+            # A method-level rejection is definitive evidence that no turn was
+            # accepted by the old target.  It is safe to migrate that event to
+            # a newly configured native app-server thread; an uncertain
+            # timeout without such evidence must remain bound to its original
+            # target so that we never duplicate a possibly accepted turn.
+            error_text = str(pending.get("last_conversation_error") or "").lower()
+            rejected_by_target = (
+                "active writer" in error_text
+                or "thread not found" in error_text
+            )
+            if not (
+                pending.get("status") == "uncertain"
+                and not pending.get("conversation_turn_id")
+                and rejected_by_target
+            ):
+                return self._refresh_target(pending)
+            old_event_id = pending.get("event_id")
+            pending["conversation_attempted"] = False
+            pending["conversation_submitted"] = False
+            pending.pop("attempted_at", None)
+            pending.pop("conversation_turn_id", None)
+            pending.pop("confirmation_retry_attempts", None)
+            pending["status"] = "pending"
+            pending["next_retry_at"] = int(self.now())
+            self.store.event(
+                "scheduled_refresh_submission_reset_after_target_rejection",
+                previous_thread_id=previous,
+                thread_id=target,
+                old_event_id=old_event_id,
+            )
+        old_event_id = pending.get("event_id")
+        pending["target_thread_id"] = target
+        scheduled_at = int(pending.get("scheduled_at") or self.now())
+        pending["event_id"] = f"{target}:{scheduled_at}"
+        for event in self.store.state.setdefault("pending_scheduled_refresh_events", []):
+            if event.get("event_id") == old_event_id:
+                event.update(pending)
+        self.store.event(
+            "scheduled_refresh_target_selected",
+            previous_thread_id=previous,
+            thread_id=target,
+            scheduled_at=scheduled_at,
+        )
+        self.store.save()
+        return target
+
+    def _schedule_refresh_confirmation_retry(self, pending: dict[str, Any]) -> None:
+        attempts = int(pending.get("confirmation_retry_attempts") or 0) + 1
+        pending["confirmation_retry_attempts"] = attempts
+        pending["next_retry_at"] = int(self.now()) + retry_delay(attempts)
+        self.store.event(
+            "scheduled_refresh_waiting_for_confirmation",
+            event_id=pending.get("event_id"),
+            retry_at=pending["next_retry_at"],
+            attempts=attempts,
+        )
+        self.store.save()
+
+    def _queue_refresh_retry(
+        self,
+        pending: dict[str, Any],
+        event_name: str,
+        error: str,
+        reset_submission: bool = False,
+    ) -> None:
+        attempts = int(pending.get("conversation_retry_attempts") or 0) + 1
+        pending["conversation_retry_attempts"] = attempts
+        pending["status"] = "retry"
+        pending["last_conversation_error"] = error
+        pending["next_retry_at"] = int(self.now()) + retry_delay(attempts)
+        if reset_submission:
+            pending["conversation_attempted"] = False
+            pending["conversation_submitted"] = False
+            pending.pop("attempted_at", None)
+            pending.pop("conversation_turn_id", None)
+        self.store.event(
+            event_name,
+            event_id=pending.get("event_id"),
+            thread_id=self._refresh_target(pending),
+            retry_at=pending["next_retry_at"],
+            attempts=attempts,
+            error=error,
+        )
+        self.store.save()
+
     def _confirm_uncertain_refresh(self, pending: dict[str, Any]) -> bool:
-        target = str(self.config.get("scheduled_refresh_thread_id") or "")
+        target = self._refresh_target(pending)
         if not target:
             return False
         try:
@@ -1576,7 +2196,7 @@ class QuotaGuard:
 
     def _confirm_submitted_refresh(self, pending: dict[str, Any]) -> bool:
         """Confirm execution evidence for an already accepted refresh turn."""
-        target = str(self.config.get("scheduled_refresh_thread_id") or "")
+        target = self._refresh_target(pending)
         turn_id = pending.get("conversation_turn_id")
         if not target or not turn_id:
             return False
@@ -1593,6 +2213,30 @@ class QuotaGuard:
         turns = thread.get("turns") if isinstance(thread, dict) else None
         turns = turns if isinstance(turns, list) else []
         matched = next((turn for turn in turns if isinstance(turn, dict) and str(turn.get("id")) == str(turn_id)), None)
+        if matched is None:
+            wait_for_completion = getattr(self.client, "wait_for_turn_completion", None)
+            if callable(wait_for_completion):
+                completion_timeout = min(
+                    5.0,
+                    float(self.config.get("quota_read_timeout_seconds") or 5),
+                )
+                matched = wait_for_completion(target, str(turn_id), completion_timeout)
+        if (
+            matched is None
+            and isinstance(thread, dict)
+            and thread.get("_turns_unavailable")
+            and (thread.get("status") or {}).get("type") == "idle"
+        ):
+            # Some managed desktop builds expose no turn history at all.  A
+            # turn/start response with an in-progress turn followed by the
+            # same dedicated thread becoming idle is the strongest available
+            # completion evidence on that protocol version.  It is kept
+            # distinct from turn-level evidence in the audit record.
+            matched = {
+                "id": turn_id,
+                "status": "completed",
+                "_completion_evidence": "thread_idle_without_turn_history",
+            }
         if matched is None:
             return False
         status = self._turn_status(matched)
@@ -1614,21 +2258,102 @@ class QuotaGuard:
             event_id=pending.get("event_id"),
             turn_id=turn_id,
             turn_status=status,
+            completion_evidence=matched.get("_completion_evidence", "turn"),
         )
         self.store.save()
         return True
 
+    def _is_pending_refresh_event(self, candidate: dict[str, Any]) -> bool:
+        status = candidate.get("status")
+        if status in {"pending", "retry"}:
+            return True
+        return bool(
+            self.config.get("scheduled_refresh_delivery") == "local_app_server_bridge"
+            and status == "delegated"
+            and not candidate.get("conversation_submitted")
+        )
+
+    def _select_pending_refresh_event(self) -> dict[str, Any] | None:
+        """Select one durable refresh event without replaying legacy spam.
+
+        Older builds could leave several unsubmitted ``delegated`` records in
+        the state file.  Once delivery is moved to the local bridge, those
+        records represent missed schedule points, not four independent model
+        turns.  Keep the newest event as the durable identity and fold the
+        older points into its missed-count summary.
+        """
+        events = self.store.state.setdefault("pending_scheduled_refresh_events", [])
+        if self.config.get("scheduled_refresh_delivery") == "local_app_server_bridge":
+            legacy = [
+                candidate
+                for candidate in events
+                if candidate.get("status") == "delegated"
+                and not candidate.get("conversation_submitted")
+            ]
+            if legacy:
+                selected = max(
+                    legacy,
+                    key=lambda candidate: float(candidate.get("scheduled_at") or 0),
+                )
+                if len(legacy) > 1:
+                    merged_ids = [
+                        str(candidate.get("event_id"))
+                        for candidate in legacy
+                        if candidate is not selected
+                    ]
+                    missed_count = sum(
+                        int(candidate.get("missed_count") or 0)
+                        for candidate in legacy
+                    ) + len(legacy) - 1
+                    selected["missed_count"] = missed_count
+                    selected["legacy_merged_event_ids"] = merged_ids
+                    selected["next_retry_at"] = int(self.now())
+                    for candidate in legacy:
+                        if candidate is selected:
+                            continue
+                        candidate["status"] = "merged"
+                        candidate["merged_into"] = selected.get("event_id")
+                    self.store.event(
+                        "scheduled_refresh_legacy_events_merged",
+                        selected_event_id=selected.get("event_id"),
+                        merged_event_ids=merged_ids,
+                        missed_count=missed_count,
+                    )
+                    self.store.save()
+                return selected
+        return next(
+            (candidate for candidate in events if self._is_pending_refresh_event(candidate)),
+            None,
+        )
+
     def _deliver_pending_refresh(self) -> None:
         pending = self.store.state.get("pending_scheduled_refresh")
         if not pending:
-            events = self.store.state.setdefault("pending_scheduled_refresh_events", [])
-            for candidate in events:
-                if candidate.get("status") in {"pending", "retry"}:
-                    pending = candidate
-                    self.store.state["pending_scheduled_refresh"] = candidate
-                    break
+            pending = self._select_pending_refresh_event()
+            if pending:
+                self.store.state["pending_scheduled_refresh"] = pending
         if not pending or int(pending.get("next_retry_at") or 0) > int(self.now()):
             return
+        if self.config.get("scheduled_refresh_delivery") == "local_app_server_bridge":
+            # A legacy delegated event was never sent.  Re-open it as a real
+            # local conversation event; this is safe because no turn id was
+            # recorded as accepted by the old automation path.
+            if pending.get("status") == "delegated" and not pending.get("conversation_submitted"):
+                pending["status"] = "pending"
+                pending["conversation_delivery"] = "local_app_server_bridge"
+                pending["next_retry_at"] = int(self.now())
+                self.store.event(
+                    "scheduled_refresh_legacy_delivery_migrated",
+                    event_id=pending.get("event_id"),
+                )
+                self.store.save()
+            # Do not retarget an uncertain submission: it may already have
+            # been accepted by the old target.  Query that original target
+            # first, just as the normal exactly-once path requires.
+            if not pending.get("conversation_attempted") and not pending.get("conversation_submitted"):
+                if self._ensure_refresh_bridge_thread(pending) is None:
+                    return
+        target = self._retarget_pending_refresh(pending)
         pending.setdefault("status", "pending")
         if pending.get("status") == "submitting":
             # A crash between turn/start and persisting its response leaves a
@@ -1642,16 +2367,13 @@ class QuotaGuard:
             self.store.save()
         if pending.get("status") == "uncertain":
             if not self._confirm_uncertain_refresh(pending):
-                self.store.event(
-                    "scheduled_refresh_waiting_for_confirmation",
-                    event_id=pending.get("event_id"),
-                )
+                self._schedule_refresh_confirmation_retry(pending)
                 return
         if pending.get("conversation_submitted") and pending.get("status") != "confirmed":
             if not self._confirm_submitted_refresh(pending):
+                self._schedule_refresh_confirmation_retry(pending)
                 return
         message = self._pending_refresh_message(pending)
-        target = str(self.config.get("scheduled_refresh_thread_id") or "")
         if target and not pending.get("conversation_submitted"):
             if self._dry_run():
                 self.store.event("would_send_refresh_message", thread_id=target)
@@ -1662,6 +2384,29 @@ class QuotaGuard:
                     return
                 try:
                     thread = self.read_thread(target)
+                except AppServerMethodError as error:
+                    # A daemon-created persistent thread may exist but not be
+                    # loaded into this app-server worker yet.  This is not a
+                    # missing target: turn/start is the operation that loads
+                    # it.  Only this explicit protocol error bypasses the
+                    # read-before-submit gate; other method errors remain a
+                    # retryable delivery failure.
+                    if "thread not loaded" in error.message.lower():
+                        self.store.event(
+                            "refresh_message_target_not_loaded",
+                            thread_id=target,
+                            error=str(error),
+                        )
+                        thread = {"status": {"type": "notLoaded"}}
+                    else:
+                        pending["next_retry_at"] = int(self.now()) + 60
+                        self.store.event(
+                            "refresh_message_target_read_failed",
+                            thread_id=target,
+                            error=str(error),
+                        )
+                        self.store.save()
+                        return
                 except AppServerError as error:
                     pending["next_retry_at"] = int(self.now()) + 60
                     self.store.event(
@@ -1677,20 +2422,16 @@ class QuotaGuard:
                     self.store.save()
                     return
                 if status == "notLoaded":
-                    try:
-                        result = self.client.call("thread/resume", {"threadId": target})
-                    except AppServerError as error:
-                        pending["next_retry_at"] = int(self.now()) + 60
-                        self.store.event(
-                            "refresh_message_target_busy_or_unavailable",
-                            thread_id=target,
-                            error=str(error),
-                        )
-                        self.store.save()
-                        return
-                    thread = result.get("thread") or {}
-                    status = (thread.get("status") or {}).get("type")
-                if status != "idle":
+                    # The managed app-server can report a thread as notLoaded
+                    # while rejecting thread/resume with -32600 "already has
+                    # an active writer".  turn/start is the actual operation
+                    # we need and can load the dedicated thread itself; do not
+                    # make resume a prerequisite for delivery.
+                    self.store.event(
+                        "refresh_message_target_not_loaded",
+                        thread_id=target,
+                    )
+                elif status != "idle":
                     pending["next_retry_at"] = int(self.now()) + 60
                     self.store.event("refresh_message_target_unavailable", thread_id=target, status=status)
                     self.store.save()
@@ -1700,7 +2441,8 @@ class QuotaGuard:
                 pending["status"] = "submitting"
                 self.store.save()
                 prompt = (
-                    "【额度守护定时会话】请立即调用 get_usage_limits 刷新五小时额度，"
+                    "【额度守护定时会话】本专用会话已提供名为 get_usage_limits 的额度工具。"
+                    "请先实际调用这个工具一次，读取返回的五小时和总额度，"
                     "简短回复五小时剩余百分比及接口返回的重置时间（北京时间）。"
                     "这是用户授权的定时请求。不要调用 bank reset，不要创建或恢复 goal，"
                     "不要修改项目或设置。"
@@ -1718,7 +2460,20 @@ class QuotaGuard:
                     pending["status"] = "accepted"
                     self.store.event("scheduled_refresh_conversation_submitted", thread_id=target, turn_id=turn_id, scheduled_at=pending.get("scheduled_at"))
                     self.store.save()
-                except AppServerError as error:
+                except AppServerMethodError as error:
+                    if error.is_active_writer:
+                        self._queue_refresh_retry(
+                            pending,
+                            "refresh_message_target_writer_busy",
+                            str(error),
+                            reset_submission=True,
+                        )
+                        self._notify_once(
+                            f"refresh-writer-busy:{target}",
+                            "Codex 定时会话被占用",
+                            "专用刷新会话当前有其他 writer，占用解除后将自动重试；额度读取不受影响",
+                        )
+                        return
                     pending["status"] = "uncertain"
                     self.store.event("scheduled_refresh_conversation_uncertain", thread_id=target, error=str(error))
                     self.notify("Codex 定时会话提交待确认", str(error))
@@ -1740,10 +2495,7 @@ class QuotaGuard:
                 if event.get("event_id") == pending.get("event_id"):
                     event.update(pending)
             self.store.state["pending_scheduled_refresh"] = None
-            for candidate in events:
-                if candidate.get("status") in {"pending", "retry"}:
-                    self.store.state["pending_scheduled_refresh"] = candidate
-                    break
+            self.store.state["pending_scheduled_refresh"] = self._select_pending_refresh_event()
             self.store.save()
             return
         attempts = int(pending.get("notification_attempts") or 0) + 1
@@ -1787,6 +2539,7 @@ class QuotaGuard:
         event_id = f"{self.config.get('scheduled_refresh_thread_id') or 'notification'}:{int(due_times[-1])}"
         event = {
             "event_id": event_id,
+            "target_thread_id": self.config.get("scheduled_refresh_thread_id") or None,
             "scheduled_at": due_times[-1],
             "missed_count": missed_count,
             "primary_remaining": limits.primary_remaining,
@@ -2163,6 +2916,13 @@ class ActionProcess:
             persist=not bool(self.config.get("dry_run")),
         )
         self.guard = QuotaGuard(client, self.config, self.store, now=now, sleep=sleep)
+        if self.client is not None:
+            try:
+                self.client.dynamic_tool_handler = self.guard._handle_refresh_dynamic_tool
+            except (AttributeError, TypeError):
+                # Lightweight test doubles and read-only client adapters may
+                # intentionally not expose the app-server tool hook.
+                pass
 
     def _record_validity(self, record: dict[str, Any]) -> str:
         """Return whether a published reader result is safe for actions."""
@@ -2766,6 +3526,7 @@ def main(argv: list[str] | None = None) -> int:
         request_timeout=float(config["quota_read_timeout_seconds"]),
     )
     guard = QuotaGuard(client, config, store)
+    client.dynamic_tool_handler = guard._handle_refresh_dynamic_tool
     try:
         if args.once:
             limits = guard.run_once()

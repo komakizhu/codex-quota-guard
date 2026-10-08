@@ -18,6 +18,49 @@ SPEC.loader.exec_module(MODULE)
 
 
 class QuotaPolicyTests(unittest.TestCase):
+    def test_refresh_dynamic_tool_reads_local_quota_interface(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params, deadline=None):
+                self.calls.append((method, params))
+                self.assertion = deadline
+                if method == "account/rateLimits/read":
+                    return {
+                        "rateLimitsByLimitId": {
+                            "codex": {
+                                "primary": {"usedPercent": 20, "resetsAt": 2000},
+                                "secondary": {"usedPercent": 35, "resetsAt": 3000},
+                            }
+                        },
+                        "rateLimitResetCredits": {"availableCount": 1},
+                    }
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "health_file": str(root / "health.json"),
+            })
+            client = Client()
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            result = guard._handle_refresh_dynamic_tool(
+                "item/tool/call",
+                {"tool": "get_usage_limits", "arguments": {}},
+            )
+            snapshot = json.loads(result["contentItems"][0]["text"])
+            self.assertEqual(snapshot["primary_remaining_percent"], 80)
+            self.assertEqual(snapshot["secondary_remaining_percent"], 65)
+            self.assertEqual(snapshot["primary_resets_at"], 2000)
+            self.assertEqual(snapshot["secondary_resets_at"], 3000)
+            self.assertEqual(snapshot["reset_credit_count"], 1)
+            self.assertEqual([method for method, _ in client.calls], ["account/rateLimits/read"])
+
     def test_scheduled_refresh_starts_real_conversation_once(self):
         class Client:
             def __init__(self):
@@ -48,6 +91,388 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertEqual(client.started[0]["threadId"], "target")
             self.assertIn("get_usage_limits", client.started[0]["input"][0]["text"])
             self.assertIsNone(store.state["pending_scheduled_refresh"])
+
+    def test_active_writer_is_retryable_and_retargets_unsubmitted_refresh(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                if method == "thread/read":
+                    return {"thread": {"id": "new-target", "status": {"type": "notLoaded"}}}
+                if method == "turn/start":
+                    raise MODULE.AppServerMethodError(
+                        "turn/start",
+                        {"code": -32600, "message": "thread new-target already has an active writer"},
+                    )
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_thread_id": "new-target",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["pending_scheduled_refresh"] = {
+                "event_id": "old-target:999",
+                "scheduled_at": 999,
+                "next_retry_at": 1000,
+                "status": "pending",
+            }
+            client = Client()
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            guard._deliver_pending_refresh()
+
+            pending = store.state["pending_scheduled_refresh"]
+            self.assertEqual(pending["target_thread_id"], "new-target")
+            self.assertEqual(pending["event_id"], "new-target:999")
+            self.assertEqual(pending["status"], "retry")
+            self.assertFalse(pending.get("conversation_attempted", False))
+            self.assertEqual([method for method, _ in client.calls], ["thread/read", "turn/start"])
+            self.assertTrue(any(
+                event["event"] == "refresh_message_target_writer_busy"
+                for event in store.events
+            ))
+
+    def test_uncertain_refresh_schedules_confirmation_retry_instead_of_spinning(self):
+        class Client:
+            def __init__(self):
+                self.reads = 0
+
+            def call(self, method, params):
+                if method == "thread/read":
+                    self.reads += 1
+                    return {"thread": {"turns": []}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_thread_id": "target",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["pending_scheduled_refresh"] = {
+                "event_id": "target:999",
+                "scheduled_at": 999,
+                "attempted_at": 999,
+                "conversation_attempted": True,
+                "status": "uncertain",
+                "next_retry_at": 1000,
+            }
+            client = Client()
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            guard._deliver_pending_refresh()
+            first_retry = store.state["pending_scheduled_refresh"]["next_retry_at"]
+            guard._deliver_pending_refresh()
+            self.assertGreater(first_retry, 1000)
+            self.assertEqual(client.reads, 1)
+            self.assertTrue(any(
+                event["event"] == "scheduled_refresh_waiting_for_confirmation"
+                and event.get("retry_at") == first_retry
+                for event in store.events
+            ))
+
+    def test_legacy_codex_automation_delivery_migrates_to_real_bridge_turn(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                if method == "thread/start":
+                    return {"thread": {"id": "bridge-thread", "status": {"type": "idle"}}}
+                if method == "thread/read":
+                    return {"thread": {
+                        "id": "bridge-thread",
+                        "status": {"type": "idle"},
+                        "turns": [{
+                            "id": "bridge-turn",
+                            "status": "completed",
+                            "result": {"ok": True},
+                        }],
+                    }}
+                if method == "turn/start":
+                    return {"turn": {"id": "bridge-turn"}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            client = Client()
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "codex_automation",
+                "scheduled_refresh_thread_id": "unavailable-target",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["pending_scheduled_refresh"] = {
+                "event_id": "unavailable-target:999",
+                "scheduled_at": 999,
+                "next_retry_at": 1000,
+                "status": "delegated",
+            }
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            guard._deliver_pending_refresh()
+            self.assertEqual(
+                config["scheduled_refresh_delivery"], "local_app_server_bridge"
+            )
+            self.assertEqual(
+                store.state["scheduled_refresh_bridge_thread_id"], "bridge-thread"
+            )
+            self.assertIsNone(store.state["pending_scheduled_refresh"])
+            self.assertEqual(
+                [method for method, _ in client.calls],
+                ["thread/start", "thread/read", "turn/start", "thread/read"],
+            )
+            self.assertTrue(any(
+                event["event"] == "refresh_bridge_thread_created"
+                for event in store.events
+            ))
+            self.assertTrue(any(
+                event["event"] == "scheduled_refresh_conversation_submitted"
+                for event in store.events
+            ))
+
+    def test_legacy_delegated_event_is_requeued_after_restart(self):
+        class Client:
+            def call(self, method, params):
+                if method == "thread/start":
+                    return {"thread": {"id": "bridge-thread"}}
+                if method == "thread/read":
+                    return {"thread": {
+                        "status": {"type": "idle"},
+                        "turns": [{"id": "bridge-turn", "status": "completed", "result": {"ok": True}}],
+                    }}
+                if method == "turn/start":
+                    return {"turn": {"id": "bridge-turn"}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "codex_automation",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["pending_scheduled_refresh_events"] = [{
+                "event_id": "old:999",
+                "scheduled_at": 999,
+                "status": "delegated",
+                "conversation_submitted": False,
+                "conversation_delivery": "codex_automation",
+            }]
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: 1000)
+            guard._deliver_pending_refresh()
+            self.assertIsNone(store.state["pending_scheduled_refresh"])
+            self.assertTrue(any(
+                event["event"] == "scheduled_refresh_legacy_delivery_migrated"
+                for event in store.events
+            ))
+
+    def test_multiple_legacy_delegated_events_are_merged_into_one_turn(self):
+        class Client:
+            def __init__(self):
+                self.turn_starts = 0
+
+            def call(self, method, params):
+                if method == "thread/start":
+                    return {"thread": {"id": "bridge-thread"}}
+                if method == "thread/read":
+                    return {"thread": {
+                        "status": {"type": "idle"},
+                        "turns": [{
+                            "id": "bridge-turn",
+                            "status": "completed",
+                            "result": {"ok": True},
+                        }],
+                    }}
+                if method == "turn/start":
+                    self.turn_starts += 1
+                    return {"turn": {"id": "bridge-turn"}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "codex_automation",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["pending_scheduled_refresh_events"] = [
+                {
+                    "event_id": f"old:{scheduled_at}",
+                    "scheduled_at": scheduled_at,
+                    "status": "delegated",
+                    "conversation_submitted": False,
+                }
+                for scheduled_at in (100, 200, 300)
+            ]
+            client = Client()
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            guard._deliver_pending_refresh()
+
+            self.assertEqual(client.turn_starts, 1)
+            self.assertIsNone(store.state["pending_scheduled_refresh"])
+            selected = next(
+                event for event in store.state["pending_scheduled_refresh_events"]
+                if event.get("scheduled_at") == 300
+            )
+            self.assertEqual(selected["missed_count"], 2)
+            self.assertEqual(
+                {event["status"] for event in store.state["pending_scheduled_refresh_events"]},
+                {"merged", "confirmed"},
+            )
+            self.assertTrue(any(
+                event["event"] == "scheduled_refresh_legacy_events_merged"
+                for event in store.events
+            ))
+
+    def test_refresh_bridge_reuses_persisted_thread_and_does_not_create_duplicate(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+                self.turn_number = 0
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                if method == "thread/read":
+                    turn_id = f"turn-{self.turn_number}"
+                    return {"thread": {
+                        "id": "bridge-thread",
+                        "status": {"type": "idle"},
+                        "turns": ([{
+                            "id": turn_id,
+                            "status": "completed",
+                            "result": {"ok": True},
+                        }] if self.turn_number else []),
+                    }}
+                if method == "turn/start":
+                    self.turn_number += 1
+                    return {"turn": {"id": f"turn-{self.turn_number}"}}
+                if method == "thread/start":
+                    raise AssertionError("bridge thread must be reused")
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server_bridge",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["scheduled_refresh_bridge_thread_id"] = "bridge-thread"
+            store.state["scheduled_refresh_bridge_capability_version"] = MODULE.REFRESH_BRIDGE_CAPABILITY_VERSION
+            client = Client()
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            for scheduled_at in (999, 1000):
+                store.state["pending_scheduled_refresh"] = {
+                    "event_id": f"bridge-thread:{scheduled_at}",
+                    "scheduled_at": scheduled_at,
+                    "next_retry_at": 1000,
+                    "status": "pending",
+                }
+                guard._deliver_pending_refresh()
+            self.assertEqual(
+                [method for method, _ in client.calls].count("thread/start"), 0
+            )
+            self.assertEqual(
+                [method for method, _ in client.calls].count("turn/start"), 2
+            )
+
+    def test_old_refresh_bridge_is_upgraded_only_after_idle(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                if method == "thread/read":
+                    return {"thread": {"id": params["threadId"], "status": {"type": "idle"}}}
+                if method == "thread/start":
+                    return {"thread": {"id": "new-bridge", "status": {"type": "idle"}}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server_bridge",
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["scheduled_refresh_bridge_thread_id"] = "old-bridge"
+            store.state["scheduled_refresh_bridge_capability_version"] = None
+            client = Client()
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            pending = {"event_id": "old-bridge:1000", "scheduled_at": 1000}
+            self.assertEqual(guard._ensure_refresh_bridge_thread(pending), "new-bridge")
+            self.assertEqual(store.state["scheduled_refresh_bridge_capability_version"], MODULE.REFRESH_BRIDGE_CAPABILITY_VERSION)
+            start_params = next(params for method, params in client.calls if method == "thread/start")
+            self.assertEqual(start_params["dynamicTools"][0]["name"], "get_usage_limits")
+            self.assertTrue(any(e["event"] == "refresh_bridge_thread_upgrade_required" for e in store.events))
+
+    def test_refresh_confirmation_uses_completion_when_turn_history_is_unavailable(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                if method == "thread/read" and params.get("includeTurns") is True:
+                    raise MODULE.AppServerMethodError(
+                        method,
+                        {"code": -32601, "message": "list_turns is not supported yet"},
+                    )
+                if method == "thread/read":
+                    return {"thread": {"status": {"type": "idle"}}}
+                raise AssertionError(method)
+
+            def wait_for_turn_completion(self, thread_id, turn_id, timeout):
+                self.calls.append(("wait_for_turn_completion", {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "timeout": timeout,
+                }))
+                return {"id": turn_id, "status": "completed", "result": {"ok": True}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(Client(), config, store, now=lambda: 1000)
+            pending = {
+                "event_id": "bridge:999",
+                "target_thread_id": "bridge",
+                "conversation_turn_id": "turn-1",
+                "conversation_submitted": True,
+                "status": "accepted",
+            }
+            self.assertTrue(guard._confirm_submitted_refresh(pending))
+            self.assertEqual(pending["status"], "confirmed")
+            self.assertTrue(any(
+                event["event"] == "scheduled_refresh_execution_confirmed"
+                and event["completion_evidence"] == "turn"
+                for event in store.events
+            ))
 
     def test_uncertain_refresh_queries_thread_before_confirmation(self):
         class Client:
@@ -541,6 +966,56 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertEqual(store.state["paused_threads"], {})
             self.assertTrue(any(e["event"] == "interrupt_verification_failed" for e in store.events))
 
+    def test_goal_pause_uses_native_goal_state_and_turn_stop(self):
+        class FakeClient:
+            supports_goal_control = True
+
+            def __init__(self):
+                self.running = True
+                self.goal_status = "active"
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                if method == "thread/list":
+                    return {"data": [{"id": "goal-thread", "status": {"type": "active"}}]}
+                if method == "thread/read":
+                    return {"thread": {
+                        "id": "goal-thread",
+                        "name": "goal worker",
+                        "status": {"type": "active" if self.running else "idle"},
+                        "turns": [{"id": "goal-turn", "status": "inProgress"}] if self.running else [],
+                    }}
+                if method == "thread/goal/get":
+                    return {"goal": {
+                        "threadId": "goal-thread",
+                        "objective": "test goal",
+                        "status": self.goal_status,
+                    }}
+                if method == "thread/goal/set":
+                    self.goal_status = params["status"]
+                    return {"goal": {"threadId": "goal-thread", "status": self.goal_status}}
+                if method == "turn/interrupt":
+                    self.running = False
+                    return {}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            client = FakeClient()
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            self.assertEqual(guard.force_stop_active_threads(2000), 1)
+            self.assertTrue(store.state["paused_threads"]["goal-thread"]["goal_paused_verified"])
+            methods = [method for method, _ in client.calls]
+            self.assertLess(methods.index("thread/goal/set"), methods.index("turn/interrupt"))
+            self.assertTrue(any(e["event"] == "goal_pause_and_turn_stop_verified" for e in store.events))
+
     def test_dry_run_does_not_write_state_or_consume_credit(self):
         class FakeClient:
             def __init__(self, payload):
@@ -626,7 +1101,10 @@ class QuotaPolicyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            config = MODULE.merged_config({"notify_desktop": False})
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server",
+            })
             store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
             store.state["next_fixed_refresh_at"] = due
             guard = MODULE.QuotaGuard(FakeClient(), config, store, now=lambda: now)
@@ -656,7 +1134,10 @@ class QuotaPolicyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            config = MODULE.merged_config({"notify_desktop": False})
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server",
+            })
             store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
             store.state["next_fixed_refresh_at"] = datetime(
                 2026, 10, 6, 7, 1, tzinfo=timezone
@@ -682,7 +1163,10 @@ class QuotaPolicyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            config = MODULE.merged_config({"notify_desktop": False})
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server",
+            })
             store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
             store.state["next_fixed_refresh_at"] = due
             guard = MODULE.QuotaGuard(FakeClient(), config, store, now=lambda: now)
@@ -708,7 +1192,10 @@ class QuotaPolicyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            config = MODULE.merged_config({"notify_desktop": False})
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server",
+            })
             store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
             store.state["next_fixed_refresh_at"] = due
             guard = MODULE.QuotaGuard(FakeClient(), config, store, now=lambda: clock[0])
@@ -1070,7 +1557,10 @@ class QuotaPolicyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            config = MODULE.merged_config({"notify_desktop": False})
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "scheduled_refresh_delivery": "local_app_server",
+            })
             store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
             guard = MODULE.QuotaGuard(FakeClient(), config, store, now=lambda: clock[0])
             with self.assertRaises(Finished):
