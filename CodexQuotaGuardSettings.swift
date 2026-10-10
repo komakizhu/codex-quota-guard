@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import SwiftUI
 
@@ -376,9 +377,9 @@ final class SettingsModel: ObservableObject {
                     if let data = try? Data(contentsOf: stateURL),
                        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                        object["config_revision"] as? String == revision,
-                       self.healthFileIsFresh(Self.defaultReaderHealthURL(), revision: revision),
-                       self.healthFileIsFresh(Self.defaultActionsHealthURL(), revision: revision),
-                       self.healthFileIsFresh(Self.defaultWatchdogURL(), revision: revision) {
+                       self.healthFileIsFresh(Self.defaultReaderHealthURL(), revision: revision, role: "reader"),
+                       self.healthFileIsFresh(Self.defaultActionsHealthURL(), revision: revision, role: "actions"),
+                       self.healthFileIsFresh(Self.defaultWatchdogURL(), revision: revision, role: "supervisor") {
                         confirmed = true
                         break
                     }
@@ -394,18 +395,26 @@ final class SettingsModel: ObservableObject {
         }
     }
 
-    private func healthFileIsFresh(_ url: URL, revision: String) -> Bool {
+    private func healthFileIsFresh(_ url: URL, revision: String, role: String) -> Bool {
         guard let health = readHealth(url),
               health["config_revision"] as? String == revision,
               let pid = health["pid"] as? NSNumber,
               pid.intValue > 0,
               let instance = health["instance_id"] as? String,
               !instance.isEmpty,
+              health["role"] as? String == role,
               let heartbeat = health["heartbeat_at"] as? NSNumber else {
             return false
         }
+        guard processIsAlive(pid.int32Value) else { return false }
         let configuredInterval = (health["heartbeat_interval_seconds"] as? NSNumber)?.doubleValue ?? 5
         return Date().timeIntervalSince1970 - heartbeat.doubleValue <= max(15, configuredInterval * 3)
+    }
+
+    private func processIsAlive(_ pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
     }
 
     static func defaultConfigURL() -> URL {
@@ -471,9 +480,14 @@ final class SettingsModel: ObservableObject {
         let legacy = readHealth(Self.defaultHealthURL())
         let actions = readHealth(Self.defaultActionsHealthURL())
         let watchdog = readHealth(Self.defaultWatchdogURL())
-        let readerStatus = processHealthText(reader, label: "读取")
-        let actionsStatus = processHealthText(actions, label: "动作")
-        let watchdogStatus = processHealthText(watchdog, label: "监督")
+        let loadedRevision = currentConfigRevision()
+        let readerStatus = processHealthText(reader, label: "读取", expectedRevision: loadedRevision, expectedRole: "reader")
+        let actionsStatus = processHealthText(actions, label: "动作", expectedRevision: loadedRevision, expectedRole: "actions")
+        let watchdogStatus = processHealthText(watchdog, label: "监督", expectedRevision: loadedRevision, expectedRole: "supervisor")
+        let desktopStatus = desktopControlText(
+            actions,
+            processReady: processHealthIsUsable(actionsStatus)
+        )
         let primary = healthWindowText(reader, label: "5小时", key: "primary")
         let secondary = healthWindowText(reader, label: "总额度", key: "secondary")
         let legacyHint = reader == nil && legacy != nil ? "；旧健康文件仅供诊断" : ""
@@ -481,7 +495,7 @@ final class SettingsModel: ObservableObject {
         formatter.locale = Locale(identifier: "zh_CN")
         formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
         formatter.dateFormat = "HH:mm:ss"
-        healthMessage = "刷新 \(formatter.string(from: Date()))；\(readerStatus)；\(primary)；\(secondary)；\(actionsStatus)；\(watchdogStatus)\(legacyHint)"
+        healthMessage = "刷新 \(formatter.string(from: Date()))；\(readerStatus)；\(primary)；\(secondary)；\(desktopStatus)；\(actionsStatus)；\(watchdogStatus)\(legacyHint)"
     }
 
     private func readHealth(_ url: URL) -> [String: Any]? {
@@ -495,7 +509,15 @@ final class SettingsModel: ObservableObject {
         return object
     }
 
-    private func processHealthText(_ health: [String: Any]?, label: String) -> String {
+    private func currentConfigRevision() -> String? {
+        guard let data = try? Data(contentsOf: Self.defaultConfigURL()),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object["config_revision"] as? String
+    }
+
+    private func processHealthText(_ health: [String: Any]?, label: String, expectedRevision: String? = nil, expectedRole: String? = nil) -> String {
         guard let health else { return "\(label)：未运行" }
         if health["_read_error"] as? Bool == true { return "\(label)：文件损坏" }
         guard let pid = health["pid"] as? NSNumber,
@@ -504,6 +526,15 @@ final class SettingsModel: ObservableObject {
               !instance.isEmpty,
               let heartbeat = health["heartbeat_at"] as? NSNumber else {
             return "\(label)：状态无效"
+        }
+        guard processIsAlive(pid.int32Value) else { return "\(label)：进程已退出" }
+        if let expectedRole,
+           health["role"] as? String != expectedRole {
+            return "\(label)：角色不匹配"
+        }
+        if let expectedRevision,
+           health["config_revision"] as? String != expectedRevision {
+            return "\(label)：未加载新配置"
         }
         let heartbeatInterval = (health["heartbeat_interval_seconds"] as? NSNumber)?.doubleValue ?? 5
         if Date().timeIntervalSince1970 - heartbeat.doubleValue > max(15, heartbeatInterval * 3) {
@@ -514,6 +545,40 @@ final class SettingsModel: ObservableObject {
             return "\(label)：\(status)（\(error)）"
         }
         return "\(label)：\(status)"
+    }
+
+    private func processHealthIsUsable(_ text: String) -> Bool {
+        let invalidMarkers = ["未运行", "文件损坏", "状态无效", "进程已退出", "心跳过期", "未加载新配置", "角色不匹配"]
+        return !invalidMarkers.contains(where: text.contains)
+    }
+
+    private func desktopControlText(_ health: [String: Any]?, processReady: Bool) -> String {
+        guard processReady else { return "桌面控制：后台未确认" }
+        guard let health else { return "桌面控制：未运行" }
+        if health["_read_error"] as? Bool == true { return "桌面控制：动作健康文件损坏" }
+        let value = health["desktop_control_status"] as? String ?? "unknown"
+        let capabilities = health["desktop_control_capabilities"] as? [String: Any] ?? [:]
+        let goalResume = capabilities["goal_resume"] as? Bool
+        let goalPause = capabilities["goal_pause"] as? Bool
+        let turnInterrupt = capabilities["turn_interrupt"] as? Bool
+        let capabilitySuffix: String
+        if goalResume == false {
+            capabilitySuffix = "；Goal恢复受限"
+        } else if goalPause == true && turnInterrupt == true {
+            capabilitySuffix = "；暂停/中止已取证"
+        } else {
+            capabilitySuffix = "；控制能力未完整验证"
+        }
+        switch value {
+        case "available": return "桌面控制：可用\(capabilitySuffix)"
+        case "limited":
+            if let error = health["desktop_control_last_error"] as? String, !error.isEmpty {
+                return "桌面控制：受限\(capabilitySuffix)（\(error)）"
+            }
+            return "桌面控制：受限\(capabilitySuffix)"
+        case "unavailable": return "桌面控制：不可用\(capabilitySuffix)"
+        default: return "桌面控制：未验证\(capabilitySuffix)"
+        }
     }
 
     private func healthWindowText(_ health: [String: Any]?, label: String, key: String) -> String {

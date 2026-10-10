@@ -2,9 +2,12 @@ import importlib.util
 import json
 import pathlib
 import queue
+import socket
+import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime
 from unittest.mock import patch
@@ -19,6 +22,397 @@ SPEC.loader.exec_module(MODULE)
 
 
 class QuotaPolicyTests(unittest.TestCase):
+    def test_desktop_canonical_history_overrides_empty_legacy_turns(self):
+        state = {
+            "id": "desktop-thread",
+            "threadRuntimeStatus": {"type": "active", "activeFlags": []},
+            "turns": [],
+            "turnHistory": {
+                "kind": "canonical",
+                "history": {
+                    "entitiesByKey": {
+                        "turn:turn-1": {
+                            "id": "turn-1",
+                            "params": {"threadId": "desktop-thread"},
+                            "status": "inProgress",
+                        }
+                    }
+                },
+            },
+            "threadGoal": None,
+        }
+        snapshot = MODULE.normalize_desktop_conversation_state(
+            state, "owner-1", 7, 1000.0
+        )
+        self.assertEqual(snapshot["status"]["type"], "active")
+        self.assertEqual(MODULE.in_progress_turn_id(snapshot), "turn-1")
+        self.assertTrue(snapshot["_desktop_turns_confirmed"])
+
+    def test_desktop_ipc_follows_owner_and_receives_canonical_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            socket_path = root / "ipc.sock"
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(socket_path))
+            server.listen(1)
+            stop = threading.Event()
+
+            def recv_message(connection):
+                header = b""
+                while len(header) < 4:
+                    part = connection.recv(4 - len(header))
+                    if not part:
+                        return None
+                    header += part
+                size = struct.unpack("<I", header)[0]
+                payload = b""
+                while len(payload) < size:
+                    part = connection.recv(size - len(payload))
+                    if not part:
+                        return None
+                    payload += part
+                return json.loads(payload)
+
+            def send_message(connection, value):
+                payload = json.dumps(value, separators=(",", ":")).encode()
+                connection.sendall(struct.pack("<I", len(payload)) + payload)
+
+            def serve():
+                connection, _ = server.accept()
+                with connection:
+                    while not stop.is_set():
+                        message = recv_message(connection)
+                        if message is None:
+                            return
+                        method = message.get("method")
+                        request_id = message.get("requestId")
+                        if method == "initialize":
+                            send_message(connection, {
+                                "type": "response",
+                                "requestId": request_id,
+                                "resultType": "success",
+                                "method": method,
+                                "result": {"clientId": "diagnostic-client"},
+                            })
+                        elif method == "thread-stream-following-changed":
+                            params = message.get("params") or {}
+                            if params.get("following"):
+                                send_message(connection, {
+                                    "type": "broadcast",
+                                    "method": "thread-stream-state-changed",
+                                    "sourceClientId": "desktop-owner",
+                                    "params": {
+                                        "conversationId": params["conversationId"],
+                                        "hostId": "local",
+                                        "change": {
+                                            "type": "snapshot",
+                                            "revision": 3,
+                                            "conversationState": {
+                                                "id": "desktop-thread",
+                                                "turns": [],
+                                                "threadRuntimeStatus": {"type": "active"},
+                                                "turnHistory": {
+                                                    "kind": "canonical",
+                                                    "history": {
+                                                        "entitiesByKey": {
+                                                            "turn:turn-1": {
+                                                                "id": "turn-1",
+                                                                "params": {"threadId": "desktop-thread"},
+                                                                "status": "inProgress",
+                                                            }
+                                                        }
+                                                    },
+                                                },
+                                                "threadGoal": None,
+                                            },
+                                        },
+                                    },
+                                })
+
+            server_thread = threading.Thread(target=serve, daemon=True)
+            server_thread.start()
+            client = MODULE.DesktopIPCClient(str(socket_path), request_timeout=2)
+            try:
+                snapshot = client.read_thread("desktop-thread", timeout=2)
+                self.assertEqual(snapshot["_desktop_owner_client_id"], "desktop-owner")
+                self.assertEqual(snapshot["_desktop_snapshot_revision"], 3)
+                self.assertEqual(MODULE.in_progress_turn_id(snapshot), "turn-1")
+            finally:
+                stop.set()
+                client.close()
+                server.close()
+                server_thread.join(timeout=1)
+
+    def test_desktop_goal_resume_is_explicitly_blocked_without_native_entry(self):
+        client = MODULE.DesktopIPCClient()
+        with self.assertRaises(MODULE.DesktopIPCUnsupported):
+            client.resume_goal("desktop-thread")
+
+    def test_desktop_start_turn_uses_follower_turn_start_envelope(self):
+        client = MODULE.DesktopIPCClient()
+        client._owners["desktop-thread"] = "desktop-owner"
+        calls = []
+
+        def fake_call(method, params, **kwargs):
+            calls.append((method, params, kwargs))
+            return {"result": {"turn": {"id": "new-turn"}}}
+
+        client.call = fake_call
+        result = client.start_turn("desktop-thread", "继续普通任务", timeout=3)
+
+        self.assertEqual(result["result"]["turn"]["id"], "new-turn")
+        self.assertEqual(calls[0][0], "thread-follower-start-turn")
+        self.assertEqual(calls[0][2]["target_client_id"], "desktop-owner")
+        turn_start = calls[0][1]["turnStart"]
+        self.assertEqual(turn_start["request"]["threadId"], "desktop-thread")
+        self.assertEqual(turn_start["request"]["input"][0]["text"], "继续普通任务")
+        self.assertTrue(turn_start["context"]["inheritThreadSettings"])
+
+    def test_desktop_allowlist_does_not_fallback_to_managed_not_loaded(self):
+        class ManagedClient:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append(method)
+                if method == "thread/list":
+                    return {"data": [{"id": "desktop-thread", "status": {"type": "notLoaded"}}]}
+                raise AssertionError(method)
+
+        class DesktopReadOnly:
+            supports_goal_pause = True
+            supports_goal_resume = False
+            supports_turn_interrupt = True
+
+            def read_thread(self, thread_id, timeout=None):
+                return {
+                    "id": thread_id,
+                    "status": {"type": "active"},
+                    "turns": [{"id": "turn-1", "status": "inProgress"}],
+                    "_desktop_snapshot_confirmed": True,
+                    "_desktop_owner_client_id": "desktop-owner",
+                }
+
+            def read_goal(self, thread):
+                return None, True
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "desktop_control_mode": "readonly",
+                "desktop_control_thread_ids": ["desktop-thread"],
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "health_file": str(root / "health.json"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            managed = ManagedClient()
+            guard = MODULE.QuotaGuard(
+                managed, config, store, now=lambda: 1000, desktop_client=DesktopReadOnly()
+            )
+            listed = guard.list_threads()
+            self.assertEqual(listed[0]["status"]["type"], "active")
+            self.assertEqual(MODULE.in_progress_turn_id(listed[0]), "turn-1")
+            self.assertEqual(managed.calls, ["thread/list"])
+
+    def test_desktop_writes_require_verified_goal_resume_capability(self):
+        class ManagedClient:
+            def call(self, method, params):
+                raise AssertionError("managed task control must not be reached")
+
+        class DesktopClient:
+            supports_goal_pause = True
+            supports_goal_resume = False
+            supports_turn_interrupt = True
+
+            def read_thread(self, thread_id, timeout=None):
+                raise AssertionError("desktop write gate should stop before reading")
+
+            def read_goal(self, thread):
+                return None, False
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "desktop_control_mode": "control",
+                "desktop_control_task_mode": "goal",
+                "desktop_control_writes_enabled": True,
+                "desktop_control_thread_ids": ["desktop-thread"],
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "health_file": str(root / "health.json"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(
+                ManagedClient(), config, store, now=lambda: 1000, desktop_client=DesktopClient()
+            )
+            self.assertEqual(guard.force_stop_active_threads(2000), 0)
+            self.assertEqual(store.state["desktop_control_status"], "limited")
+            self.assertTrue(any(e["event"] == "notification" for e in store.events))
+
+    def test_desktop_unknown_goal_state_never_falls_back_to_turn_interrupt(self):
+        class ManagedClient:
+            def call(self, method, params):
+                if method == "thread/list":
+                    return {"data": [{"id": "desktop-thread", "status": {"type": "active"}}]}
+                raise AssertionError(method)
+
+        class DesktopClient:
+            supports_goal_pause = True
+            supports_goal_resume = True
+            supports_turn_interrupt = True
+
+            def __init__(self):
+                self.interrupt_calls = []
+
+            def read_thread(self, thread_id, timeout=None):
+                return {
+                    "id": thread_id,
+                    "status": {"type": "active"},
+                    "turns": [{"id": "turn-1", "status": "inProgress"}],
+                    "_desktop_snapshot_confirmed": True,
+                    "_desktop_owner_client_id": "desktop-owner",
+                }
+
+            def read_goal(self, thread):
+                return None, False
+
+            def interrupt_turn(self, *args, **kwargs):
+                self.interrupt_calls.append((args, kwargs))
+                raise AssertionError("unknown Goal state must block all desktop writes")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "desktop_control_mode": "control",
+                "desktop_control_task_mode": "goal",
+                "desktop_control_writes_enabled": True,
+                "desktop_control_thread_ids": ["desktop-thread"],
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "health_file": str(root / "health.json"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["desktop_control_capabilities"] = {
+                "owner_discovery": True,
+                "state_subscription": True,
+                "turn_interrupt": True,
+                "goal_pause": True,
+                "goal_resume": True,
+            }
+            desktop = DesktopClient()
+            guard = MODULE.QuotaGuard(
+                ManagedClient(), config, store, now=lambda: 1000, desktop_client=desktop
+            )
+            self.assertEqual(guard.force_stop_active_threads(2000), 0)
+            self.assertEqual(desktop.interrupt_calls, [])
+            self.assertTrue(any(
+                event["event"] == "desktop_goal_state_unconfirmed"
+                for event in store.events
+            ))
+
+    def test_turn_only_desktop_stop_and_start_are_separately_verified(self):
+        class ManagedClient:
+            def call(self, method, params):
+                if method == "thread/list":
+                    return {"data": [{"id": "turn-thread", "status": {"type": "active"}}]}
+                raise AssertionError(method)
+
+        class DesktopClient:
+            supports_goal_pause = True
+            supports_goal_resume = False
+            supports_turn_interrupt = True
+            supports_turn_start = True
+
+            def __init__(self):
+                self.phase = "running"
+                self.interrupts = []
+                self.starts = []
+
+            def read_thread(self, thread_id, timeout=None):
+                if self.phase == "running":
+                    status = "active"
+                    turns = [{"id": "turn-1", "status": "inProgress"}]
+                elif self.phase == "stopped":
+                    status = "active"
+                    turns = []
+                else:
+                    status = "active"
+                    turns = [{"id": "turn-2", "status": "inProgress"}]
+                return {
+                    "id": thread_id,
+                    "status": {"type": status},
+                    "turns": turns,
+                    "_desktop_snapshot_confirmed": True,
+                    "_desktop_turns_confirmed": True,
+                    "_desktop_conversation_state": {
+                        "threadRuntimeStatus": {"type": status, "activeFlags": []}
+                    },
+                    "_desktop_owner_client_id": "desktop-owner",
+                    "_desktop_snapshot_revision": 1,
+                }
+
+            def read_goal(self, thread):
+                return None, True
+
+            def interrupt_turn(self, thread_id, mode, expected_turn_id):
+                self.interrupts.append((thread_id, mode, expected_turn_id))
+                self.assert_expected(expected_turn_id)
+                self.phase = "stopped"
+                return {"ok": True, "interruptedTurnId": expected_turn_id}
+
+            def start_turn(self, thread_id, text):
+                self.starts.append((thread_id, text))
+                self.phase = "started"
+                return {"result": {"turn": {"id": "turn-2"}}}
+
+            @staticmethod
+            def assert_expected(turn_id):
+                if turn_id != "turn-1":
+                    raise AssertionError(turn_id)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "desktop_control_mode": "control",
+                "desktop_control_task_mode": "turn_only",
+                "desktop_control_writes_enabled": True,
+                "desktop_control_thread_ids": ["turn-thread"],
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "health_file": str(root / "health.json"),
+            })
+            clock = [1000.0]
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            desktop = DesktopClient()
+            guard = MODULE.QuotaGuard(
+                ManagedClient(),
+                config,
+                store,
+                now=lambda: clock[0],
+                sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+                desktop_client=desktop,
+            )
+
+            self.assertEqual(guard.force_stop_active_threads(2000), 1)
+            self.assertEqual(desktop.interrupts, [("turn-thread", "system", "turn-1")])
+            paused = store.state["paused_threads"]["turn-thread"]
+            self.assertEqual(paused["control_mode"], "turn_only")
+            self.assertTrue(paused["turn_stopped_verified"])
+
+            clock[0] = 2061.0
+            limits = MODULE.Limits(50, 50, 3000, 4000, 0, [], {})
+            guard.resume_paused_threads(limits)
+            self.assertEqual(len(desktop.starts), 1)
+            self.assertEqual(desktop.starts[0][0], "turn-thread")
+            self.assertEqual(store.state["paused_threads"], {})
+            self.assertTrue(any(event["event"] == "turn_stop_verified" for event in store.events))
+            self.assertTrue(any(event["event"] == "turn_start_verified" for event in store.events))
+
     def test_refresh_dynamic_tool_reads_local_quota_interface(self):
         class Client:
             def __init__(self):
@@ -1159,6 +1553,209 @@ class QuotaPolicyTests(unittest.TestCase):
             self.assertLess(methods.index("thread/goal/set"), methods.index("turn/interrupt"))
             self.assertTrue(any(e["event"] == "goal_pause_and_turn_stop_verified" for e in store.events))
 
+    def test_goal_pause_is_owned_when_turn_stop_fails_and_retried(self):
+        class FakeClient:
+            supports_goal_control = True
+
+            def __init__(self):
+                self.goal_status = "active"
+                self.running = True
+                self.interrupt_attempts = 0
+
+            def call(self, method, params):
+                if method == "thread/list":
+                    return {"data": [{"id": "goal-thread", "status": {"type": "active"}}]}
+                if method == "thread/read":
+                    return {"thread": {
+                        "id": "goal-thread",
+                        "name": "goal worker",
+                        "status": {"type": "active" if self.running else "idle"},
+                        "turns": [{"id": "goal-turn", "status": "inProgress"}] if self.running else [],
+                    }}
+                if method == "thread/goal/get":
+                    return {"goal": {"status": self.goal_status, "objective": "test goal"}}
+                if method == "thread/goal/set":
+                    self.goal_status = params["status"]
+                    return {"goal": {"status": self.goal_status}}
+                if method == "turn/interrupt":
+                    self.interrupt_attempts += 1
+                    if self.interrupt_attempts == 1:
+                        raise MODULE.AppServerError("simulated interrupt failure")
+                    self.running = False
+                    return {}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            clock = [1000.0]
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            client = FakeClient()
+            guard = MODULE.QuotaGuard(
+                client,
+                config,
+                store,
+                now=lambda: clock[0],
+                sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+            )
+            self.assertEqual(guard.force_stop_active_threads(2000), 0)
+            partial = store.state["paused_threads"]["goal-thread"]
+            self.assertTrue(partial["goal_paused_verified"])
+            self.assertFalse(partial["turn_stopped_verified"])
+            self.assertEqual(partial["stop_phase"], "goal_paused_turn_pending")
+            self.assertTrue(any(e["event"] == "goal_pause_partial" for e in store.events))
+
+            clock[0] += 20
+            self.assertEqual(guard.force_stop_active_threads(2000), 1)
+            self.assertTrue(store.state["paused_threads"]["goal-thread"]["turn_stopped_verified"])
+            self.assertTrue(any(e["event"] == "goal_pause_and_turn_stop_verified" for e in store.events))
+
+    def test_partial_goal_pause_is_finished_before_resume(self):
+        class FakeClient:
+            supports_goal_control = True
+
+            def __init__(self):
+                self.goal_status = "paused"
+                self.running = True
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, dict(params)))
+                if method == "thread/read":
+                    turns = [{
+                        "id": "active-turn" if self.running else "resumed-turn",
+                        "status": "inProgress",
+                    }] if self.running else []
+                    return {"thread": {
+                        "id": params["threadId"],
+                        "status": {"type": "active" if self.running else "idle"},
+                        "turns": turns,
+                    }}
+                if method == "thread/goal/get":
+                    return {"goal": {"status": self.goal_status, "objective": "import"}}
+                if method == "turn/interrupt":
+                    self.running = False
+                    return {}
+                if method == "thread/goal/set":
+                    self.goal_status = params["status"]
+                    self.running = self.goal_status == "active"
+                    return {}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            store.state["paused_threads"]["goal-thread"] = {
+                "thread_id": "goal-thread",
+                "turn_id": "active-turn",
+                "title": "goal worker",
+                "reset_at": 2000,
+                "goal_paused_verified": True,
+                "turn_stopped_verified": False,
+                "stop_phase": "goal_paused_turn_pending",
+            }
+            client = FakeClient()
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 2070)
+            limits = MODULE.Limits(50, 50, 3000, 4000, 0, [], {})
+            guard.resume_paused_threads(limits)
+            methods = [method for method, _ in client.calls]
+            self.assertIn("turn/interrupt", methods)
+            self.assertIn("thread/goal/set", methods)
+            self.assertNotIn("turn/start", methods)
+            self.assertEqual(store.state["paused_threads"], {})
+            self.assertTrue(any(e["event"] == "resume_verified_goal_native" for e in store.events))
+
+    def test_not_loaded_desktop_task_marks_control_limited_without_action(self):
+        class FakeClient:
+            def call(self, method, params):
+                if method == "thread/list":
+                    return {"data": [{"id": "desktop-thread", "status": {"type": "active"}}]}
+                if method == "thread/read":
+                    return {"thread": {"id": "desktop-thread", "status": {"type": "notLoaded"}}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "health_file": str(root / "health.json"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(FakeClient(), config, store, now=lambda: 1000)
+            self.assertEqual(guard.force_stop_active_threads(2000), 0)
+            self.assertEqual(store.state["desktop_control_status"], "limited")
+            self.assertEqual(store.state["paused_threads"], {})
+            self.assertTrue(any(e["event"] == "desktop_control_unavailable" for e in store.events))
+
+    def test_production_app_server_never_controls_unverified_desktop_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            client = MODULE.AppServerClient.__new__(MODULE.AppServerClient)
+            guard = MODULE.QuotaGuard(client, config, store, now=lambda: 1000)
+            self.assertEqual(guard.force_stop_active_threads(2000), 0)
+            self.assertEqual(store.state["desktop_control_status"], "limited")
+            self.assertTrue(any(e["event"] == "notification" for e in store.events))
+
+    def test_scheduled_refresh_is_queued_when_limits_are_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "notify_desktop": False,
+                "state_file": str(root / "state.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "scheduled_refresh_delivery": "local_app_server",
+            })
+            store = MODULE.StateStore(root / "state.json", root / "events.jsonl")
+            guard = MODULE.QuotaGuard(object(), config, store, now=lambda: 1000)
+            guard.next_fixed_refresh_at = 999
+            guard._process_fixed_refresh(None)
+            pending = store.state["pending_scheduled_refresh"]
+            self.assertIsNotNone(pending)
+            self.assertIsNone(pending["primary_remaining"])
+            self.assertTrue(any(e["event"] == "scheduled_refresh_event_created" for e in store.events))
+
+    def test_reader_expiry_uses_reader_timeout_budget(self):
+        class Client:
+            def call(self, method, params, **kwargs):
+                return {"rateLimitsByLimitId": {"codex": {
+                    "primary": {"usedPercent": 20, "resetsAt": 2000},
+                    "secondary": {"usedPercent": 30, "resetsAt": 3000},
+                }}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = MODULE.merged_config({
+                "reader_state_file": str(root / "reader.json"),
+                "reader_health_file": str(root / "reader-health.json"),
+                "quota_result_file": str(root / "quota-results.jsonl"),
+                "notify_desktop": False,
+            })
+            reader = MODULE.QuotaReader(
+                Client(), config, now=lambda: 1000.0, monotonic=lambda: 1000.0
+            )
+            reader.read_once()
+            self.assertEqual(
+                reader.state["primary_data_expires_at"] - reader.next_quota_check_at,
+                30,
+            )
+
     def test_dry_run_does_not_write_state_or_consume_credit(self):
         class FakeClient:
             def __init__(self, payload):
@@ -1685,6 +2282,45 @@ class QuotaPolicyTests(unittest.TestCase):
                 "secondary_data_expires_at": 1300,
             }
             self.assertEqual(guard._record_validity(record), "primary_invalid")
+
+    def test_action_process_keeps_fresh_primary_when_secondary_window_is_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            result_file = root / "quota-results.jsonl"
+            result_file.write_text(json.dumps({
+                "sequence": 1,
+                "recorded_at": 1000,
+                "primary_remaining": 3,
+                "secondary_remaining": None,
+                "primary_resets_at": 2000,
+                "secondary_resets_at": None,
+                "primary_data_status": "current",
+                "secondary_data_status": "invalid",
+                "primary_data_expires_at": 1300,
+                "secondary_data_expires_at": 1000,
+                "valid": False,
+                "error": "secondary missing",
+            }) + "\n")
+            config = MODULE.merged_config({
+                "state_file": str(root / "actions.json"),
+                "event_log_file": str(root / "events.jsonl"),
+                "quota_result_file": str(result_file),
+                "actions_health_file": str(root / "actions-health.json"),
+                "notify_desktop": False,
+                "force_stop_active_turns": False,
+            })
+            guard = MODULE.ActionProcess(object(), config, now=lambda: 1000.0)
+            # This regression covers partial reader-result consumption only;
+            # keep the action side disabled so the object stub is never used
+            # as a desktop-control client.
+            guard.guard.config["force_stop_active_turns"] = False
+            observed = guard._partial_limits_from_record(json.loads(result_file.read_text()))
+            self.assertIsNotNone(observed)
+            self.assertEqual(observed.primary_remaining, 3)
+            self.assertIsNone(observed.secondary_remaining)
+            guard.process_results()
+            self.assertEqual(guard.store.state["last_consumed_quota_sequence"], 1)
+            self.assertTrue(any(e["event"] == "quota_result_partial" for e in guard.store.events))
 
     def test_dry_run_action_process_does_not_write_any_files(self):
         with tempfile.TemporaryDirectory() as directory:

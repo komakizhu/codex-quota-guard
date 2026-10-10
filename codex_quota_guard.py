@@ -42,6 +42,8 @@ RESUME_TERMINAL_STATUSES = {"completed", "archived"}
 UNKNOWN_THREAD_STATUSES = {"notLoaded", "loading"}
 SHARED_SUPPORT_DIR = pathlib.Path.home() / "Library/Application Support/CodexQuotaGuard"
 REFRESH_BRIDGE_CAPABILITY_VERSION = 1
+DESKTOP_IPC_PROTOCOL_VERSION = 1
+DESKTOP_IPC_DEFAULT_SOCKET = pathlib.Path.home() / ".codex/ipc/ipc.sock"
 
 
 def default_state() -> dict[str, Any]:
@@ -87,6 +89,16 @@ def default_state() -> dict[str, Any]:
         "primary_last_error": None,
         "secondary_last_error": None,
         "quota_failure_notified": {"primary": False, "secondary": False},
+        "desktop_control_status": "unknown",
+        "desktop_control_source": "unconfigured",
+        "desktop_control_capabilities": {},
+        "desktop_owner_client_id": None,
+        "desktop_snapshot_revision": None,
+        "desktop_snapshot_at": None,
+        "desktop_control_operations": {},
+        "desktop_control_last_success_at": None,
+        "desktop_control_last_checked_at": None,
+        "desktop_control_last_error": None,
         "config_revision": None,
         "config_loaded_at": None,
         "updated_at": None,
@@ -389,6 +401,23 @@ def merged_config(value: dict[str, Any]) -> dict[str, Any]:
         "dry_run": False,
         "scheduled_refresh_enabled": True,
         "scheduled_refresh_delivery": "local_app_server_bridge",
+        # The managed app-server socket is not proof that the process is
+        # attached to the foreground desktop Codex host.  Keep destructive
+        # task controls disabled until a supported desktop adapter has been
+        # independently verified.
+        "desktop_control_verified": False,
+        # The desktop IPC adapter is opt-in. A read-only diagnostic client
+        # may discover and follow a desktop conversation, but a persisted
+        # boolean is never capability evidence for destructive controls.
+        "desktop_control_mode": "disabled",
+        # ``turn_only`` controls the current ordinary turn and starts a fresh
+        # ordinary turn after the reset. ``goal`` retains the stricter Goal
+        # pause/resume path and stays blocked without verified Goal APIs.
+        "desktop_control_task_mode": "turn_only",
+        "desktop_ipc_socket": str(DESKTOP_IPC_DEFAULT_SOCKET),
+        "desktop_control_thread_ids": [],
+        "desktop_control_writes_enabled": False,
+        "desktop_ipc_interrupt_version": 3,
         # launchd starts the service without the repository as its cwd (often
         # "/").  Use the guard's own directory unless the user configured a
         # dedicated read-only workspace explicitly.
@@ -433,6 +462,34 @@ def merged_config(value: dict[str, Any]) -> dict[str, Any]:
         delivery = "local_app_server_bridge"
     defaults["scheduled_refresh_delivery"] = delivery
     defaults["force_stop_active_turns"] = True
+    desktop_mode = str(defaults.get("desktop_control_mode") or "disabled").lower()
+    if desktop_mode not in {"disabled", "readonly", "control"}:
+        raise ValueError("desktop_control_mode 必须是 disabled、readonly 或 control")
+    defaults["desktop_control_mode"] = desktop_mode
+    task_mode = str(defaults.get("desktop_control_task_mode") or "turn_only").lower()
+    if task_mode not in {"turn_only", "goal"}:
+        raise ValueError("desktop_control_task_mode 必须是 turn_only 或 goal")
+    defaults["desktop_control_task_mode"] = task_mode
+    defaults["desktop_ipc_socket"] = str(
+        pathlib.Path(str(defaults["desktop_ipc_socket"])).expanduser()
+    )
+    thread_ids = defaults.get("desktop_control_thread_ids") or []
+    if isinstance(thread_ids, str):
+        thread_ids = [thread_ids]
+    if not isinstance(thread_ids, (list, tuple, set)):
+        raise ValueError("desktop_control_thread_ids 必须是线程 ID 列表")
+    defaults["desktop_control_thread_ids"] = [str(item) for item in thread_ids if str(item)]
+    # Keep the legacy field readable, but never let it grant write access.
+    defaults["desktop_control_writes_enabled"] = bool(
+        defaults.get("desktop_control_writes_enabled", False)
+    )
+    try:
+        interrupt_version = int(defaults.get("desktop_ipc_interrupt_version", 3))
+    except (TypeError, ValueError) as error:
+        raise ValueError("desktop_ipc_interrupt_version 必须是整数") from error
+    if not 1 <= interrupt_version <= 20:
+        raise ValueError("desktop_ipc_interrupt_version 必须在 1 到 20 之间")
+    defaults["desktop_ipc_interrupt_version"] = interrupt_version
     for key in ("primary_warning_percent", "secondary_warning_percent"):
         number = float(defaults[key])
         if not 0 <= number <= 100:
@@ -925,6 +982,525 @@ class AppServerClient:
             socket_to_close.close()
 
 
+class DesktopIPCError(AppServerError):
+    """The foreground Codex desktop IPC channel is unavailable or invalid."""
+
+
+class DesktopIPCUnsupported(DesktopIPCError):
+    """The desktop channel does not expose a verified native operation."""
+
+
+def _desktop_turns_from_state(conversation_state: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """Extract turns from canonical history without treating an empty legacy list as idle.
+
+    The desktop stream currently publishes ``turnHistory.kind == canonical``
+    while ``conversationState.turns`` may intentionally be empty.  Only a
+    snapshot with a known history structure is considered a trustworthy
+    source of turn state.
+    """
+    history_wrapper = conversation_state.get("turnHistory")
+    if isinstance(history_wrapper, dict) and history_wrapper.get("kind") == "canonical":
+        history = history_wrapper.get("history")
+        entities = history.get("entitiesByKey") if isinstance(history, dict) else None
+        if not isinstance(entities, dict):
+            return [], False
+        turns: list[dict[str, Any]] = []
+        for key, raw in entities.items():
+            value = raw
+            if isinstance(raw, dict) and isinstance(raw.get("turn"), dict):
+                value = raw["turn"]
+            if not isinstance(value, dict):
+                continue
+            params = value.get("params") if isinstance(value.get("params"), dict) else value
+            thread_id = params.get("threadId") if isinstance(params, dict) else None
+            if thread_id and str(thread_id) != str(conversation_state.get("id")):
+                continue
+            turn = dict(value)
+            turn_id = turn.get("id") or turn.get("turnId")
+            if not turn_id and isinstance(key, str) and key.startswith("turn:"):
+                turn_id = key.split(":", 1)[1]
+            if turn_id:
+                turn["id"] = str(turn_id)
+            status = turn.get("status")
+            if isinstance(status, dict):
+                status_type = status.get("type")
+                if status_type is not None:
+                    turn["status"] = status_type
+            turns.append(turn)
+        turns.sort(
+            key=lambda item: (
+                timestamp_value(item.get("turnStartedAtMs")) or 0,
+                timestamp_value(item.get("startedAt")) or 0,
+                str(item.get("id") or ""),
+            )
+        )
+        return turns, True
+    legacy_turns = conversation_state.get("turns")
+    if not isinstance(legacy_turns, list):
+        return [], False
+    normalized: list[dict[str, Any]] = []
+    for raw in legacy_turns:
+        if not isinstance(raw, dict):
+            continue
+        turn = dict(raw)
+        status = turn.get("status")
+        if isinstance(status, dict):
+            turn["status"] = status.get("type")
+        normalized.append(turn)
+    return normalized, True
+
+
+def normalize_desktop_conversation_state(
+    conversation_state: dict[str, Any],
+    owner_client_id: str,
+    revision: int,
+    observed_at: float,
+) -> dict[str, Any]:
+    """Convert a desktop stream snapshot to the guard's task snapshot shape."""
+    turns, turns_confirmed = _desktop_turns_from_state(conversation_state)
+    runtime = conversation_state.get("threadRuntimeStatus")
+    status_type = runtime.get("type") if isinstance(runtime, dict) else None
+    if status_type is None:
+        status_type = (
+            ACTIVE_THREAD_STATUS
+            if any(turn.get("status") == IN_PROGRESS_TURN_STATUS for turn in turns)
+            else "idle"
+        )
+    snapshot: dict[str, Any] = {
+        "id": conversation_state.get("id") or conversation_state.get("sessionId"),
+        "name": conversation_state.get("title"),
+        "title": conversation_state.get("title"),
+        "cwd": conversation_state.get("cwd"),
+        "status": {"type": str(status_type)},
+        "turns": turns,
+        "_desktop_snapshot_confirmed": True,
+        "_desktop_owner_client_id": owner_client_id,
+        "_desktop_snapshot_revision": revision,
+        "_desktop_snapshot_at": observed_at,
+        "_desktop_turns_confirmed": turns_confirmed,
+        "_desktop_conversation_state": conversation_state,
+    }
+    # These keys are deliberately explicit.  A missing goal is different from
+    # a goal field that was not included in an untrusted snapshot.
+    if "threadGoal" in conversation_state:
+        snapshot["goal"] = conversation_state.get("threadGoal")
+        snapshot["threadGoal"] = conversation_state.get("threadGoal")
+    elif "goal" in conversation_state:
+        snapshot["goal"] = conversation_state.get("goal")
+    return snapshot
+
+
+class DesktopIPCClient:
+    """Read desktop-owned task state through the foreground Codex IPC pipe.
+
+    This is intentionally separate from ``AppServerClient``.  It does not
+    create a model turn, does not use the managed daemon's ``notLoaded`` view,
+    and never treats a config boolean as proof of write capability.  Ordinary
+    turn control uses the desktop follower interrupt and start-turn methods.
+    Goal resume is explicitly unsupported until a cross-session native entry
+    is discovered and tested.
+    """
+
+    supports_goal_control = True
+    supports_goal_pause = True
+    supports_goal_resume = False
+    supports_turn_interrupt = True
+    supports_turn_start = True
+
+    def __init__(
+        self,
+        socket_path: str = str(DESKTOP_IPC_DEFAULT_SOCKET),
+        request_timeout: float = 5.0,
+        client_type: str = "codex-quota-guard-readonly-diagnostic",
+    ):
+        self.socket_path = str(pathlib.Path(socket_path).expanduser())
+        self.request_timeout = float(request_timeout)
+        self.client_type = client_type
+        self.socket: socket.socket | None = None
+        self.client_id: str | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._write_lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._responses: dict[str, dict[str, Any]] = {}
+        self._snapshots: dict[str, dict[str, Any]] = {}
+        self._snapshot_revisions: dict[str, int] = {}
+        self._owners: dict[str, str] = {}
+        self._following: set[str] = set()
+        self._next_request = 1
+        self._connection_error: Exception | None = None
+        self._closing = False
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DesktopIPCError("桌面 IPC 请求总期限已到")
+        return remaining
+
+    def _send_message(self, value: dict[str, Any], deadline: float | None = None) -> None:
+        sock = self.socket
+        if sock is None:
+            raise DesktopIPCError("桌面 IPC 未连接")
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        frame = struct.pack("<I", len(payload)) + payload
+        with self._write_lock:
+            if deadline is not None:
+                sock.settimeout(self._remaining(deadline))
+            sock.sendall(frame)
+            if deadline is not None:
+                sock.settimeout(None)
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, size: int) -> bytes:
+        data = b""
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise DesktopIPCError("桌面 IPC socket 已断开")
+            data += chunk
+        return data
+
+    @classmethod
+    def _recv_message(cls, sock: socket.socket) -> dict[str, Any]:
+        header = cls._recv_exact(sock, 4)
+        size = struct.unpack("<I", header)[0]
+        if size <= 0 or size > 64 * 1024 * 1024:
+            raise DesktopIPCError(f"桌面 IPC 消息长度无效：{size}")
+        raw = cls._recv_exact(sock, size)
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise DesktopIPCError("桌面 IPC 消息不是对象")
+        return value
+
+    def start(self, deadline: float | None = None) -> None:
+        if self.socket is not None and self.client_id:
+            return
+        deadline = deadline or time.monotonic() + self.request_timeout
+        path = pathlib.Path(self.socket_path)
+        if not path.exists():
+            raise DesktopIPCError(f"桌面 IPC socket 不存在：{path}")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(self._remaining(deadline))
+            sock.connect(str(path))
+            sock.settimeout(None)
+            self.socket = sock
+            self._closing = False
+            self._connection_error = None
+            self._snapshots.clear()
+            self._snapshot_revisions.clear()
+            self._owners.clear()
+            self._reader_thread = threading.Thread(
+                target=self._read_loop, args=(sock,), daemon=True, name="codex-desktop-ipc"
+            )
+            self._reader_thread.start()
+            result = self.call(
+                "initialize",
+                {"clientType": self.client_type},
+                version=0,
+                timeout=self._remaining(deadline),
+                _skip_start=True,
+            )
+            client_id = result.get("clientId") if isinstance(result, dict) else None
+            if not client_id:
+                raise DesktopIPCError("桌面 IPC initialize 没有返回 clientId")
+            self.client_id = str(client_id)
+        except Exception:
+            self.close()
+            raise
+
+    def _read_loop(self, sock: socket.socket) -> None:
+        try:
+            while not self._closing:
+                message = self._recv_message(sock)
+                if self.socket is not sock:
+                    continue
+                message_type = message.get("type")
+                if message_type == "response" and message.get("requestId") is not None:
+                    with self._condition:
+                        self._responses[str(message["requestId"])] = message
+                        self._condition.notify_all()
+                    continue
+                if message_type == "request" and message.get("method") == "client-discovery-request":
+                    # The desktop router asks clients whether they own an
+                    # unknown method.  Declining avoids leaving the router's
+                    # request pending, without claiming any app ownership.
+                    response = {
+                        "type": "response",
+                        "requestId": message.get("requestId"),
+                        "sourceClientId": self.client_id,
+                        "resultType": "success",
+                        "result": {"canHandle": False},
+                    }
+                    try:
+                        self._send_message(response)
+                    except (OSError, DesktopIPCError):
+                        pass
+                    continue
+                if message_type == "broadcast" and message.get("method") == "thread-stream-state-changed":
+                    params = message.get("params") or {}
+                    conversation_id = params.get("conversationId")
+                    change = params.get("change")
+                    if conversation_id and isinstance(change, dict):
+                        if change.get("type") != "snapshot" or not isinstance(
+                            change.get("conversationState"), dict
+                        ):
+                            with self._condition:
+                                prior = self._snapshots.get(str(conversation_id))
+                                if prior:
+                                    prior["_desktop_snapshot_confirmed"] = False
+                                self._snapshot_revisions.pop(str(conversation_id), None)
+                                self._condition.notify_all()
+                            continue
+                        revision = change.get("revision")
+                        try:
+                            revision_number = int(revision)
+                        except (TypeError, ValueError):
+                            revision_number = -1
+                        owner = str(message.get("sourceClientId") or self._owners.get(str(conversation_id)) or "")
+                        previous_revision = self._snapshot_revisions.get(str(conversation_id))
+                        if (
+                            previous_revision is not None
+                            and revision_number >= 0
+                            and revision_number != previous_revision + 1
+                        ):
+                            with self._condition:
+                                prior = self._snapshots.get(str(conversation_id))
+                                if prior:
+                                    prior["_desktop_snapshot_confirmed"] = False
+                                self._snapshot_revisions.pop(str(conversation_id), None)
+                                self._condition.notify_all()
+                            continue
+                        snapshot = normalize_desktop_conversation_state(
+                            change["conversationState"],
+                            owner,
+                            revision_number,
+                            time.time(),
+                        )
+                        with self._condition:
+                            self._snapshots[str(conversation_id)] = snapshot
+                            self._snapshot_revisions[str(conversation_id)] = revision_number
+                            self._condition.notify_all()
+                    continue
+        except Exception as error:
+            if not self._closing and self.socket is sock:
+                with self._condition:
+                    self._connection_error = error
+                    self._condition.notify_all()
+
+    def call(
+        self,
+        method: str,
+        params: dict[str, Any],
+        version: int = DESKTOP_IPC_PROTOCOL_VERSION,
+        timeout: float | None = None,
+        target_client_id: str | None = None,
+        _skip_start: bool = False,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + (self.request_timeout if timeout is None else max(0.1, timeout))
+        if not _skip_start:
+            self.start(deadline)
+        source_client_id = self.client_id or "initializing-client"
+        request_id = f"desktop-{self._next_request}"
+        self._next_request += 1
+        request: dict[str, Any] = {
+            "type": "request",
+            "requestId": request_id,
+            "sourceClientId": source_client_id,
+            "version": int(version),
+            "method": method,
+            "params": params,
+            "timeoutMs": max(1, int(self._remaining(deadline) * 1000)),
+        }
+        if target_client_id:
+            request["targetClientIds"] = [target_client_id]
+        self._send_message(request, deadline)
+        with self._condition:
+            while request_id not in self._responses:
+                if self._connection_error:
+                    raise DesktopIPCError(f"桌面 IPC 调用 {method} 时断线：{self._connection_error}")
+                self._condition.wait(timeout=self._remaining(deadline))
+            response = self._responses.pop(request_id)
+        if response.get("resultType") == "error" or response.get("error") is not None:
+            error = response.get("error") or response.get("result") or response
+            raise DesktopIPCError(f"桌面 IPC {method} 失败：{error}")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        # Owner discovery puts the routed client in the response envelope,
+        # not inside ``result``. Preserve it without exposing a second
+        # response API to callers.
+        if response.get("handledByClientId"):
+            result = dict(result)
+            result["_handledByClientId"] = response["handledByClientId"]
+        return result
+
+    def _broadcast(self, method: str, params: dict[str, Any], version: int = 1) -> None:
+        if not self.client_id:
+            raise DesktopIPCError("桌面 IPC clientId 未初始化")
+        self._send_message({
+            "type": "broadcast",
+            "sourceClientId": self.client_id,
+            "version": version,
+            "method": method,
+            "params": params,
+        })
+
+    def discover_owner(self, thread_id: str, host_id: str = "local") -> str:
+        owner = self._owners.get(str(thread_id))
+        if not owner:
+            # The desktop IPC does not expose a standalone owner-discovery
+            # request. Following the conversation is the supported discovery
+            # handshake; the owner is identified by the source of the
+            # resulting snapshot broadcast.
+            snapshot = self.read_thread(thread_id, host_id)
+            owner = snapshot.get("_desktop_owner_client_id")
+        if not owner:
+            raise DesktopIPCError(f"线程 {thread_id} 没有收到桌面 owner 快照")
+        self._owners[str(thread_id)] = str(owner)
+        return str(owner)
+
+    def read_thread(
+        self,
+        thread_id: str,
+        host_id: str = "local",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + (self.request_timeout if timeout is None else max(0.1, timeout))
+        self.start(deadline)
+        follow_params = {"conversationId": thread_id, "hostId": host_id, "following": True}
+        with self._condition:
+            prior = self._snapshots.get(str(thread_id))
+            if prior is not None:
+                # A cached snapshot is diagnostic history, not fresh evidence
+                # for a stop/start decision.  The owner will answer the
+                # following handshake with a current snapshot.
+                prior["_desktop_snapshot_confirmed"] = False
+        self._broadcast("thread-stream-following-changed", follow_params, version=1)
+        refresh_sent = False
+        with self._condition:
+            self._following.add(str(thread_id))
+            while True:
+                snapshot = self._snapshots.get(str(thread_id))
+                if snapshot and snapshot.get("_desktop_snapshot_confirmed"):
+                    snapshot = dict(snapshot)
+                    snapshot["_desktop_owner_client_id"] = self._owners.get(
+                        str(thread_id),
+                        snapshot.get("_desktop_owner_client_id"),
+                    )
+                    snapshot["_desktop_snapshot_at"] = snapshot.get("_desktop_snapshot_at") or time.time()
+                    return snapshot
+                if self._connection_error:
+                    raise DesktopIPCError(f"读取桌面线程 {thread_id} 时断线：{self._connection_error}")
+                remaining = self._remaining(deadline)
+                if snapshot is not None and not snapshot.get("_desktop_snapshot_confirmed") and not refresh_sent:
+                    refresh_sent = True
+                else:
+                    self._condition.wait(timeout=remaining)
+                    continue
+                # A revision gap or a non-snapshot delta invalidates the
+                # cached state. Ask the desktop owner for a fresh snapshot;
+                # never interpret the stale state as current.
+                self._condition.release()
+                try:
+                    self._broadcast("thread-stream-following-changed", follow_params, version=1)
+                finally:
+                    self._condition.acquire()
+
+    def read_goal(self, thread: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+        if not thread.get("_desktop_snapshot_confirmed"):
+            return None, False
+        if "goal" in thread:
+            goal = thread.get("goal")
+            return (goal if isinstance(goal, dict) else None), True
+        if "threadGoal" in thread:
+            goal = thread.get("threadGoal")
+            return (goal if isinstance(goal, dict) else None), True
+        return None, False
+
+    def interrupt_turn(
+        self,
+        thread_id: str,
+        mode: str = "system",
+        expected_turn_id: str | None = None,
+        host_id: str = "local",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        owner = self._owners.get(str(thread_id)) or self.discover_owner(thread_id, host_id)
+        params: dict[str, Any] = {
+            "conversationId": thread_id,
+            "hostId": host_id,
+            "mode": mode,
+        }
+        if expected_turn_id is not None:
+            params["expectedTurnId"] = expected_turn_id
+        # Version 3 is the desktop app's special no-expected-turn form.  A
+        # configured version is retained for protocol diagnostics, but never
+        # considered proof that the operation was accepted.
+        version = 3 if expected_turn_id is None else 4
+        return self.call(
+            "thread-follower-interrupt-turn",
+            params,
+            version=version,
+            timeout=timeout,
+            target_client_id=owner,
+        )
+
+    def start_turn(
+        self,
+        thread_id: str,
+        text: str,
+        host_id: str = "local",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Start one ordinary turn on the desktop-owned conversation.
+
+        This is deliberately not a Goal resume.  The follower protocol uses
+        the same ``turnStart`` envelope as the desktop client; the owner
+        creates a new ordinary turn and returns its result.  The caller must
+        query the desktop snapshot and verify that new turn separately.
+        """
+        owner = self._owners.get(str(thread_id)) or self.discover_owner(thread_id, host_id)
+        client_message_id = f"codex-quota-guard-{uuid.uuid4()}"
+        turn_start = {
+            "request": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": str(text), "text_elements": []}],
+                "clientUserMessageId": client_message_id,
+            },
+            "context": {"inheritThreadSettings": True},
+        }
+        return self.call(
+            "thread-follower-start-turn",
+            {"conversationId": thread_id, "turnStart": turn_start},
+            version=DESKTOP_IPC_PROTOCOL_VERSION,
+            timeout=timeout,
+            target_client_id=owner,
+        )
+
+    def resume_goal(self, thread_id: str, host_id: str = "local", timeout: float | None = None) -> dict[str, Any]:
+        raise DesktopIPCUnsupported(
+            "未发现允许独立后台调用并可验证的原生 Goal 恢复入口；thread-follower-start-turn 不能替代 Goal 恢复"
+        )
+
+    def close(self) -> None:
+        self._closing = True
+        sock = self.socket
+        self.socket = None
+        self.client_id = None
+        with self._condition:
+            self._condition.notify_all()
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 class StateStore:
     def __init__(
         self,
@@ -961,14 +1537,16 @@ class StateStore:
 class QuotaGuard:
     def __init__(
         self,
-        client: AppServerClient,
+        client: Any,
         config: dict[str, Any],
         store: StateStore,
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        desktop_client: DesktopIPCClient | None = None,
     ):
         self.client = client
+        self.desktop_client = desktop_client
         self.config = config
         self.store = store
         self.now = now
@@ -977,6 +1555,7 @@ class QuotaGuard:
         self.dynamic_tool_client: AppServerClient | None = None
         self.dynamic_tool_limits: Limits | None = None
         self.dynamic_tool_limits_at: float | None = None
+        self._active_action_operation: dict[str, Any] | None = None
         self.process_started_at = time.time()
         self.health_file = pathlib.Path(
             str(config.get("health_file") or self.store.state_file.with_name("health.json"))
@@ -998,6 +1577,8 @@ class QuotaGuard:
         self.store.state["fixed_refresh_schedule_signature"] = signature
         self.store.state["config_revision"] = config.get("config_revision")
         self.store.state["config_loaded_at"] = int(time.time())
+        if self.desktop_client is not None:
+            self.store.state["desktop_control_source"] = "desktop_ipc"
         persisted_quota_deadline = self.store.state.get("next_quota_check_at")
         if persisted_quota_deadline is None:
             self.next_quota_check_at = self.now()
@@ -1087,6 +1668,7 @@ class QuotaGuard:
         if not self.store.persist:
             return
         payload = {
+            "role": "actions",
             "pid": os.getpid(),
             "instance_id": self.config.get("_process_instance_id"),
             "process_started_at": self.process_started_at,
@@ -1109,6 +1691,16 @@ class QuotaGuard:
             "request_in_flight": self.store.state.get("request_in_flight", False),
             "request_id": self.store.state.get("request_id"),
             "request_deadline_at": self.store.state.get("request_deadline_at"),
+            "desktop_control_status": self.store.state.get("desktop_control_status", "unknown"),
+            "desktop_control_source": self.store.state.get("desktop_control_source"),
+            "desktop_control_last_success_at": self.store.state.get("desktop_control_last_success_at"),
+            "desktop_control_last_checked_at": self.store.state.get("desktop_control_last_checked_at"),
+            "desktop_control_last_error": self.store.state.get("desktop_control_last_error"),
+            "desktop_control_capabilities": self.store.state.get("desktop_control_capabilities", {}),
+            "desktop_owner_client_id": self.store.state.get("desktop_owner_client_id"),
+            "desktop_snapshot_revision": self.store.state.get("desktop_snapshot_revision"),
+            "desktop_snapshot_at": self.store.state.get("desktop_snapshot_at"),
+            "action_operation": self._active_action_operation,
         }
         payload.update(details)
         try:
@@ -1192,6 +1784,16 @@ class QuotaGuard:
             for label in ("primary", "secondary")
         ) else "quota_degraded")
 
+    def _desktop_thread_allowlist(self) -> set[str]:
+        return {
+            str(thread_id)
+            for thread_id in (self.config.get("desktop_control_thread_ids") or [])
+            if str(thread_id)
+        }
+
+    def _desktop_task_is_allowed(self, thread_id: str) -> bool:
+        return self.desktop_client is not None and str(thread_id) in self._desktop_thread_allowlist()
+
     def list_threads(self) -> list[dict[str, Any]]:
         data: list[dict[str, Any]] = []
         cursor: str | None = None
@@ -1207,14 +1809,77 @@ class QuotaGuard:
             data.extend(result.get("data") or [])
             cursor = result.get("nextCursor")
             if not cursor:
-                return data
+                break
+        if self.desktop_client is None:
+            return data
+        allowlist = self._desktop_thread_allowlist()
+        if not allowlist:
+            self._set_desktop_control_status(
+                "limited",
+                "desktop_control_thread_ids 为空；不会根据 managed app-server 状态操作任务",
+            )
+            return []
+        enriched: list[dict[str, Any]] = []
+        for listed in data:
+            thread_id = listed.get("id") if isinstance(listed, dict) else None
+            if not thread_id or str(thread_id) not in allowlist:
+                continue
+            try:
+                snapshot = self.desktop_client.read_thread(str(thread_id))
+            except DesktopIPCError as error:
+                self._set_desktop_control_status("limited", str(error))
+                self.store.event("desktop_snapshot_unavailable", thread_id=thread_id, error=str(error))
+                continue
+            if not snapshot.get("_desktop_snapshot_confirmed"):
+                self._set_desktop_control_status("limited", "桌面线程快照不可确认")
+                continue
+            merged = dict(listed)
+            merged.update(snapshot)
+            enriched.append(merged)
+        if enriched:
+            self._set_desktop_control_status("available")
+        return enriched
 
-    def read_thread(self, thread_id: str, include_turns: bool = True) -> dict[str, Any]:
+    def _call_with_deadline(
+        self,
+        method: str,
+        params: dict[str, Any],
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        if deadline is None:
+            return self.client.call(method, params)
+        try:
+            return self.client.call(method, params, deadline=deadline)
+        except TypeError as error:
+            if "deadline" not in str(error):
+                raise
+            return self.client.call(method, params)
+
+    def read_thread(
+        self,
+        thread_id: str,
+        include_turns: bool = True,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        if self.desktop_client is not None:
+            if not self._desktop_task_is_allowed(thread_id):
+                raise DesktopIPCError(
+                    f"任务 {thread_id} 不在 desktop_control_thread_ids 中；拒绝回退到 managed app-server"
+                )
+            snapshot = self.desktop_client.read_thread(
+                str(thread_id),
+                timeout=(max(0.1, deadline - time.monotonic()) if deadline is not None else None),
+            )
+            self.store.state["desktop_owner_client_id"] = snapshot.get("_desktop_owner_client_id")
+            self.store.state["desktop_snapshot_revision"] = snapshot.get("_desktop_snapshot_revision")
+            self.store.state["desktop_snapshot_at"] = snapshot.get("_desktop_snapshot_at")
+            self.store.state["desktop_control_source"] = "desktop_ipc"
+            return snapshot
         params: dict[str, Any] = {"threadId": thread_id}
         if include_turns:
             params["includeTurns"] = True
         try:
-            result = self.client.call("thread/read", params)
+            result = self._call_with_deadline("thread/read", params, deadline)
         except AppServerMethodError as error:
             # Current managed desktop app-server builds expose thread state
             # but may not implement the paginated list_turns backend.  The
@@ -1222,7 +1887,9 @@ class QuotaGuard:
             # confirmation; task-control callers must treat missing turns as
             # unverified and therefore must not interrupt or resume blindly.
             if include_turns and "list_turns is not supported" in error.message.lower():
-                result = self.client.call("thread/read", {"threadId": thread_id})
+                result = self._call_with_deadline(
+                    "thread/read", {"threadId": thread_id}, deadline
+                )
                 thread = result.get("thread") or {}
                 if isinstance(thread, dict):
                     thread["_turns_unavailable"] = True
@@ -1264,25 +1931,122 @@ class QuotaGuard:
     def _dry_run(self) -> bool:
         return bool(self.config.get("dry_run"))
 
-    def _verify_interrupted(self, thread_id: str, turn_id: str) -> bool:
+    def _begin_action_operation(self, name: str, timeout: float) -> dict[str, Any]:
+        now = time.time()
+        operation = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "started_at": now,
+            "deadline_at": now + max(0.1, float(timeout)),
+            "progress_at": now,
+        }
+        self._active_action_operation = operation
+        self._write_health("action_operation_started", action_operation=operation)
+        return operation
+
+    def _progress_action_operation(self, operation: dict[str, Any]) -> None:
+        if self._active_action_operation is not operation:
+            return
+        operation["progress_at"] = time.time()
+        self._write_health("action_operation_progress", action_operation=operation)
+
+    def _finish_action_operation(self, operation: dict[str, Any], result: str) -> None:
+        if self._active_action_operation is not operation:
+            return
+        completed = dict(operation)
+        completed["result"] = result
+        completed["completed_at"] = time.time()
+        self._active_action_operation = None
+        self._write_health("action_operation_complete", action_operation=completed)
+
+    def _set_desktop_control_status(self, status: str, error: str | None = None) -> None:
+        """Record desktop task control separately from quota-read health.
+
+        The managed app-server can be healthy while its task view belongs to a
+        different desktop host.  In that case task actions must remain
+        unverified instead of treating ``notLoaded`` as idle.
+        """
+        now = self.now()
+        self.store.state["desktop_control_status"] = status
+        self.store.state["desktop_control_source"] = (
+            "desktop_ipc" if self.desktop_client is not None else "managed_app_server"
+        )
+        self.store.state["desktop_control_last_checked_at"] = now
+        self.store.state["desktop_control_last_error"] = error
+        if self.desktop_client is not None:
+            self.store.state["desktop_control_capabilities"] = {
+                "owner_discovery": True,
+                "state_subscription": True,
+                "canonical_history": True,
+                "turn_interrupt": bool(self.desktop_client.supports_turn_interrupt),
+                "turn_start": bool(getattr(self.desktop_client, "supports_turn_start", False)),
+                "goal_pause": bool(self.desktop_client.supports_goal_pause),
+                "goal_resume": bool(self.desktop_client.supports_goal_resume),
+            }
+        if status == "available":
+            self.store.state["desktop_control_last_success_at"] = now
+        self.store.save()
+        self._write_health("desktop_control_degraded" if status != "available" else "desktop_control_available", desktop_control_status=status, desktop_control_error=error)
+
+    def _verify_interrupted(
+        self,
+        thread_id: str,
+        turn_id: str,
+        allow_active_thread_without_turn: bool = False,
+    ) -> bool:
         deadline = self.now() + 10
-        while self.now() <= deadline:
-            thread = self.read_thread(thread_id)
-            if not isinstance(thread, dict) or not thread:
-                return False
-            status = (thread.get("status") or {}).get("type")
-            active_turn_id = in_progress_turn_id(thread)
-            if active_turn_id is None and status in TERMINAL_THREAD_STATUSES:
-                return True
-            if active_turn_id is not None and active_turn_id != turn_id:
-                return False
-            self.sleep(0.25)
-        return False
+        operation = self._begin_action_operation("verify_turn_interrupt", 10)
+        result = False
+        try:
+            while self.now() <= deadline:
+                self._progress_action_operation(operation)
+                thread = self.read_thread(thread_id)
+                if not isinstance(thread, dict) or not thread:
+                    return False
+                status = (thread.get("status") or {}).get("type")
+                active_turn_id = in_progress_turn_id(thread)
+                if active_turn_id is None:
+                    if status in TERMINAL_THREAD_STATUSES:
+                        result = True
+                        return True
+                    if (
+                        allow_active_thread_without_turn
+                        and status in ACTIVE_THREAD_STATUSES
+                        and thread.get("_desktop_snapshot_confirmed") is True
+                    ):
+                        # A desktop owner can keep the conversation runtime
+                        # active after a turn ends.  For ordinary turn-only
+                        # control, the verified invariant is no active turn,
+                        # not that the conversation itself became idle.
+                        result = True
+                        return True
+                if active_turn_id is not None and active_turn_id != turn_id:
+                    return False
+                self.sleep(0.25)
+            return False
+        finally:
+            self._finish_action_operation(operation, "verified" if result else "failed")
 
     def _active_turn(self, thread: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
         if not is_candidate_thread(thread):
             return thread, None
         hydrated = self.read_thread(thread["id"])
+        if not isinstance(hydrated, dict) or not hydrated:
+            self._set_desktop_control_status("limited", "thread/read 返回空结果")
+            return {}, None
+        hydrated_status = (hydrated.get("status") or {}).get("type")
+        if hydrated_status in UNKNOWN_THREAD_STATUSES:
+            self._set_desktop_control_status(
+                "limited", f"桌面任务 {thread['id']} 在控制通道中为 {hydrated_status}"
+            )
+            self.store.event(
+                "desktop_control_unavailable",
+                thread_id=thread["id"],
+                listed_status=(thread.get("status") or {}).get("type"),
+                observed_status=hydrated_status,
+            )
+            return hydrated, None
+        self._set_desktop_control_status("available")
         return hydrated, in_progress_turn_id(hydrated)
 
     def _stop_attempt_key(self, reset_at: int, thread_id: str, turn_id: str) -> str:
@@ -1326,12 +2090,22 @@ class QuotaGuard:
         keeps unit tests honest without forcing ordinary fake clients to
         implement an experimental protocol method they are not testing.
         """
+        if self.desktop_client is not None:
+            return bool(getattr(self.desktop_client, "supports_goal_pause", False))
         return isinstance(self.client, AppServerClient) or bool(
             getattr(self.client, "supports_goal_control", False)
         )
 
     def _read_goal(self, thread_id: str, thread: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
         """Read native goal state, returning (goal, protocol_supported)."""
+        if self.desktop_client is not None:
+            if not thread.get("_desktop_snapshot_confirmed"):
+                try:
+                    thread = self.read_thread(thread_id)
+                except DesktopIPCError as error:
+                    self._set_desktop_control_status("limited", str(error))
+                    return None, False
+            return self.desktop_client.read_goal(thread)
         if not self._goal_control_capable(thread) and not self._goal_evidence(thread):
             return None, False
         try:
@@ -1352,15 +2126,260 @@ class QuotaGuard:
 
     def _verify_goal_status(self, thread_id: str, expected: str) -> bool:
         deadline = self.now() + 10
-        while self.now() <= deadline:
-            goal, supported = self._read_goal(thread_id, {})
-            if supported and self._goal_status(goal) == expected:
-                return True
-            self.sleep(0.25)
+        operation = self._begin_action_operation("verify_goal_status", 10)
+        result = False
+        try:
+            while self.now() <= deadline:
+                self._progress_action_operation(operation)
+                goal, supported = self._read_goal(thread_id, {})
+                if supported and self._goal_status(goal) == expected:
+                    result = True
+                    return True
+                self.sleep(0.25)
+            return False
+        finally:
+            self._finish_action_operation(operation, "verified" if result else "failed")
+
+    def _interrupt_task_native(self, thread_id: str, turn_id: str) -> dict[str, Any]:
+        if self.desktop_client is not None:
+            return self.desktop_client.interrupt_turn(
+                thread_id,
+                mode="system",
+                expected_turn_id=turn_id,
+            )
+        return self.client.call(
+            "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+        )
+
+    def _start_turn_native(self, thread_id: str, text: str) -> dict[str, Any]:
+        if self.desktop_client is not None:
+            return self.desktop_client.start_turn(thread_id, text)
+        return self.client.call(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": text}],
+            },
+        )
+
+    def _pause_goal_native(self, thread_id: str) -> dict[str, Any]:
+        if self.desktop_client is not None:
+            # The desktop owner performs Goal pause and turn interruption as
+            # one native system-stop path when expectedTurnId is omitted.
+            # Supplying an expected turn ID would silently downgrade this to
+            # a turn-only interrupt.
+            return self.desktop_client.interrupt_turn(
+                thread_id,
+                mode="system",
+                expected_turn_id=None,
+            )
+        return self.client.call(
+            "thread/goal/set", {"threadId": thread_id, "status": "paused"}
+        )
+
+    def _resume_goal_native(self, thread_id: str) -> dict[str, Any]:
+        if self.desktop_client is not None:
+            return self.desktop_client.resume_goal(thread_id)
+        return self.client.call(
+            "thread/goal/set", {"threadId": thread_id, "status": "active"}
+        )
+
+    def _desktop_task_mode(self) -> str:
+        """Return the configured desktop task-control mode.
+
+        Configuration is normalized by ``merged_config``.  Keep this small
+        defensive fallback for tests and callers that construct a guard from
+        an older in-memory configuration without passing through that
+        normalization step.
+        """
+        mode = str(self.config.get("desktop_control_task_mode") or "turn_only").lower()
+        return mode if mode in {"turn_only", "goal"} else "turn_only"
+
+    def _desktop_turn_only_ready(self, reset_at: int, action: str) -> bool:
+        if self.desktop_client is None:
+            return False
+        reason: str | None = None
+        if self.config.get("desktop_control_mode") != "control":
+            reason = "desktop_control_mode 不是 control"
+        elif not self.config.get("desktop_control_writes_enabled", False):
+            reason = "desktop_control_writes_enabled 未开启"
+        elif not self._desktop_thread_allowlist():
+            reason = "desktop_control_thread_ids 为空"
+        elif not getattr(self.desktop_client, "supports_turn_interrupt", False):
+            reason = "桌面 IPC 未提供 turn 中止方法"
+        elif action == "start" and not getattr(self.desktop_client, "supports_turn_start", False):
+            reason = "桌面 IPC 未提供普通 turn 启动方法"
+        if reason is None:
+            return True
+        self._set_desktop_control_status("limited", reason)
+        self._notify_once(
+            f"desktop-turn-control-unavailable:{action}:{reset_at}",
+            "Codex 额度保护受限",
+            f"普通任务 {action} 控制不可用：{reason}；未操作任何任务",
+        )
         return False
+
+    def _force_stop_desktop_turns(self, reset_at: int) -> int:
+        """Stop only the currently active ordinary desktop turns.
+
+        ``turn_only`` deliberately does not read or mutate Goal state.  It
+        records the exact turn that was interrupted and only puts that record
+        on the resume list after a fresh desktop snapshot proves that the turn
+        is gone.  A later turn is a new operation, never an implicit retry of
+        the old one.
+        """
+        if not self._desktop_turn_only_ready(reset_at, "stop"):
+            return 0
+        stopped_count = 0
+        for listed in self.list_threads():
+            thread_id = listed.get("id") if isinstance(listed, dict) else None
+            if not thread_id or not is_candidate_thread(listed):
+                continue
+            try:
+                thread, turn_id = self._active_turn(listed)
+                if not thread or (thread.get("status") or {}).get("type") in UNKNOWN_THREAD_STATUSES:
+                    continue
+                if not turn_id:
+                    self.store.event(
+                        "turn_stop_skipped_without_active_turn",
+                        thread_id=thread_id,
+                        control_mode="turn_only",
+                    )
+                    continue
+                key = self._stop_attempt_key(reset_at, str(thread_id), str(turn_id))
+                attempt = self.store.state.setdefault("stop_attempts", {}).get(key) or {}
+                if attempt.get("status") == "verified":
+                    continue
+                if int(attempt.get("next_retry_at") or 0) > int(self.now()):
+                    continue
+                if self._dry_run():
+                    self.store.event(
+                        "would_interrupt",
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        control_mode="turn_only",
+                    )
+                    continue
+                operation = {
+                    "id": str(uuid.uuid4()),
+                    "thread_id": str(thread_id),
+                    "turn_id": str(turn_id),
+                    "owner_client_id": thread.get("_desktop_owner_client_id"),
+                    "reset_at": int(reset_at),
+                    "control_mode": "turn_only",
+                    "phase": "turn_interrupt_pending",
+                    "started_at": int(self.now()),
+                }
+                self.store.state.setdefault("desktop_control_operations", {})[operation["id"]] = operation
+                self.store.state.setdefault("paused_threads", {})[str(thread_id)] = {
+                    "thread_id": str(thread_id),
+                    "turn_id": str(turn_id),
+                    "title": thread.get("name") or thread.get("preview") or str(thread_id),
+                    "cwd": thread.get("cwd"),
+                    "reset_at": int(reset_at),
+                    "control_mode": "turn_only",
+                    "goal_paused_verified": False,
+                    "turn_stopped_verified": False,
+                    "stop_phase": "turn_interrupt_pending",
+                    "control_operation_id": operation["id"],
+                    "desktop_owner_client_id": thread.get("_desktop_owner_client_id"),
+                    "paused_at": int(self.now()),
+                    "last_checked_at": int(self.now()),
+                }
+                self.store.save()
+                try:
+                    operation["response"] = self._interrupt_task_native(str(thread_id), str(turn_id))
+                    operation["phase"] = "verification_pending"
+                    if not self._verify_interrupted(
+                        str(thread_id),
+                        str(turn_id),
+                        allow_active_thread_without_turn=True,
+                    ):
+                        raise DesktopIPCError("中止后仍检测到活动 turn 或无法确认桌面快照")
+                except AppServerError as error:
+                    operation["phase"] = "failed"
+                    operation["error"] = str(error)
+                    record = self.store.state["paused_threads"].get(str(thread_id))
+                    if isinstance(record, dict):
+                        record["last_error"] = str(error)
+                        record["last_checked_at"] = int(self.now())
+                    self._record_stop_failure(key, str(error))
+                    self.store.save()
+                    self.store.event(
+                        "turn_stop_failed",
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        error=str(error),
+                        control_mode="turn_only",
+                    )
+                    continue
+                operation["phase"] = "turn_stopped_verified"
+                operation["completed_at"] = int(self.now())
+                self.store.state.setdefault("stop_attempts", {})[key] = {
+                    "status": "verified",
+                    "attempts": int(attempt.get("attempts") or 0) + 1,
+                    "last_attempt_at": int(self.now()),
+                }
+                record = self.store.state["paused_threads"][str(thread_id)]
+                record.update({
+                    "turn_stopped_verified": True,
+                    "stop_phase": "turn_stopped",
+                    "last_checked_at": int(self.now()),
+                })
+                self.store.save()
+                self.store.event(
+                    "turn_stop_verified",
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    reset_at=reset_at,
+                    control_mode="turn_only",
+                )
+                self.notify(
+                    "Codex 额度保护",
+                    f"已停止当前普通任务 turn：{thread.get('name') or thread_id}",
+                )
+                stopped_count += 1
+            except (AppServerError, OSError) as error:
+                self.store.event(
+                    "turn_stop_unavailable",
+                    thread_id=thread_id,
+                    error=str(error),
+                    control_mode="turn_only",
+                )
+        return stopped_count
 
     def force_stop_active_threads(self, reset_at: int) -> int:
         stopped_count = 0
+        if self.desktop_client is not None and self._desktop_task_mode() == "turn_only":
+            return self._force_stop_desktop_turns(reset_at)
+        desktop_capabilities = self.store.state.get("desktop_control_capabilities") or {}
+        if self.desktop_client is not None and (
+            self.config.get("desktop_control_mode") != "control"
+            or not self.config.get("desktop_control_writes_enabled", False)
+            or not self._desktop_thread_allowlist()
+            or desktop_capabilities.get("goal_resume") is not True
+        ):
+            self._set_desktop_control_status(
+                "limited",
+                "桌面 IPC 当前未取得完整 Goal 暂停/恢复证据；拒绝写操作",
+            )
+            self._notify_once(
+                f"desktop-control-unverified:{reset_at}",
+                "Codex 额度保护受限",
+                "已识别真实桌面任务，但 Goal 原生恢复能力尚未验证；未操作任何任务",
+            )
+            return 0
+        if isinstance(self.client, AppServerClient) and self.desktop_client is None and not self.config.get("desktop_control_verified", False):
+            self._set_desktop_control_status(
+                "limited",
+                "当前仅验证额度 app-server；未取得同一桌面任务的原生控制入口",
+            )
+            self._notify_once(
+                f"desktop-control-unverified:{reset_at}",
+                "Codex 额度保护受限",
+                "额度读取通道正常，但桌面任务原生暂停/中止入口尚未验证；未操作任何任务",
+            )
+            return 0
         excluded = set(self.config.get("exclude_thread_ids") or [])
         for listed in self.list_threads():
             thread_id = listed.get("id")
@@ -1369,12 +2388,42 @@ class QuotaGuard:
             turn_id: str | None = None
             try:
                 thread, turn_id = self._active_turn(listed)
+                if not thread or (thread.get("status") or {}).get("type") in UNKNOWN_THREAD_STATUSES:
+                    self._notify_once(
+                        f"desktop-control-unavailable:{reset_at}",
+                        "Codex 额度保护受限",
+                        "桌面任务状态无法从当前控制通道确认，未对任务执行暂停或中止",
+                    )
+                    continue
                 goal, goal_api_supported = self._read_goal(thread_id, thread)
                 goal_status = self._goal_status(goal)
+                if self.desktop_client is not None and not goal_api_supported:
+                    # A desktop snapshot without an explicit Goal field is
+                    # not proof that this is an ordinary turn.  Interrupting
+                    # it could leave an auto-running Goal alive, so refuse
+                    # every destructive operation until the owner publishes
+                    # an unambiguous Goal state.
+                    self.store.event(
+                        "desktop_goal_state_unconfirmed",
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                    )
+                    self._notify_once(
+                        f"desktop-goal-state-unconfirmed:{reset_at}:{thread_id}",
+                        "Codex 额度保护受限",
+                        f"任务 {thread_id} 的桌面 Goal 状态无法确认，未执行暂停或中止",
+                    )
+                    continue
+                owned_pause = self.store.state.get("paused_threads", {}).get(thread_id)
+                owned_goal_pause = bool(
+                    isinstance(owned_pause, dict)
+                    and owned_pause.get("goal_paused_verified")
+                    and int(owned_pause.get("reset_at") or 0) == int(reset_at)
+                )
                 goal_is_active = goal_status == "active" or (
                     not goal_api_supported and self._goal_evidence(thread)
-                )
-                if goal_status == "paused":
+                ) or owned_goal_pause
+                if goal_status == "paused" and not owned_goal_pause:
                     # A goal paused by the user or another controller is not
                     # ours to resume later.  Do not interrupt a turn under it
                     # and accidentally claim ownership of the pause episode.
@@ -1393,6 +2442,8 @@ class QuotaGuard:
                     )
                     continue
                 if not turn_id:
+                    key = self._stop_attempt_key(reset_at, thread_id, "goal" if goal_is_active else "unknown")
+                    attempt = (self.store.state.setdefault("stop_attempts", {})).get(key) or {}
                     if goal_is_active:
                         self.store.event(
                             "active_goal_without_verified_turn",
@@ -1404,12 +2455,37 @@ class QuotaGuard:
                             "active_thread_without_verified_turn", thread_id=thread_id,
                             title=thread.get("name") if isinstance(thread, dict) else None,
                         )
-                    if goal_status == "paused":
+                    if goal_status == "paused" and not owned_goal_pause:
                         self.store.event("goal_already_paused_not_owned", thread_id=thread_id)
+                    if goal_status == "paused" and owned_goal_pause and owned_pause:
+                        owned_pause.update({
+                            "turn_stopped_verified": True,
+                            "stop_phase": "goal_paused_turn_stopped",
+                            "last_checked_at": int(self.now()),
+                        })
+                        self.store.state.setdefault("stop_attempts", {})[key] = {
+                            "status": "verified",
+                            "attempts": int(attempt.get("attempts") or 0) + 1,
+                            "last_attempt_at": int(self.now()),
+                        }
+                        self.store.save()
+                        self.store.event("goal_pause_and_turn_stop_verified", thread_id=thread_id, turn_id=None, reset_at=reset_at)
+                        stopped_count += 1
+                        continue
                     if not goal_is_active:
                         continue
-                    key = self._stop_attempt_key(reset_at, thread_id, "goal")
-                    attempt = (self.store.state.setdefault("stop_attempts", {})).get(key) or {}
+                    if self.desktop_client is not None:
+                        self.store.event(
+                            "desktop_goal_pause_without_active_turn",
+                            thread_id=thread_id,
+                            reason="桌面原生合并暂停路径需要当前活动 turn；未执行猜测性 Goal 写入",
+                        )
+                        self._notify_once(
+                            f"desktop-goal-no-turn:{reset_at}:{thread_id}",
+                            "Codex 额度保护受限",
+                            f"任务 {thread_id} 的 Goal 没有可验证的活动 turn，未执行暂停",
+                        )
+                        continue
                     if attempt.get("status") == "verified" or int(attempt.get("next_retry_at") or 0) > int(self.now()):
                         continue
                     if self._dry_run():
@@ -1458,10 +2534,56 @@ class QuotaGuard:
                         self.store.event("would_pause_goal", thread_id=thread_id)
                     self.store.event("would_interrupt", thread_id=thread_id, turn_id=turn_id)
                     continue
-                if goal_is_active:
-                    self.client.call(
-                        "thread/goal/set", {"threadId": thread_id, "status": "paused"}
-                    )
+                desktop_combined_goal_stop = False
+                if goal_is_active and goal_status != "paused":
+                    if self.desktop_client is not None:
+                        operation = {
+                            "id": str(uuid.uuid4()),
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "owner_client_id": thread.get("_desktop_owner_client_id"),
+                            "reset_at": int(reset_at),
+                            "phase": "goal_pause_and_turn_pending",
+                            "started_at": int(self.now()),
+                        }
+                        self.store.state.setdefault("desktop_control_operations", {})[operation["id"]] = operation
+                        self.store.state["paused_threads"][thread_id] = {
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "title": thread.get("name") or thread.get("preview") or thread_id,
+                            "cwd": thread.get("cwd"),
+                            "reset_at": reset_at,
+                            "goal_paused_verified": False,
+                            "turn_stopped_verified": False,
+                            "stop_phase": "goal_pause_and_turn_pending",
+                            "goal_objective": goal.get("objective") if isinstance(goal, dict) else None,
+                            "control_operation_id": operation["id"],
+                            "desktop_owner_client_id": thread.get("_desktop_owner_client_id"),
+                            "paused_at": int(self.now()),
+                            "last_checked_at": int(self.now()),
+                        }
+                        self.store.save()
+                        try:
+                            result = self._pause_goal_native(thread_id)
+                            operation["response"] = result
+                            operation["phase"] = "verification_pending"
+                            desktop_combined_goal_stop = True
+                        except (AppServerError, DesktopIPCError) as error:
+                            operation["phase"] = "failed"
+                            operation["error"] = str(error)
+                            self._record_stop_failure(key, str(error))
+                            self.store.save()
+                            self.store.event(
+                                "desktop_goal_pause_submit_failed",
+                                thread_id=thread_id,
+                                turn_id=turn_id,
+                                error=str(error),
+                            )
+                            continue
+                    else:
+                        self.client.call(
+                            "thread/goal/set", {"threadId": thread_id, "status": "paused"}
+                        )
                     if not self._verify_goal_status(thread_id, "paused"):
                         self._record_stop_failure(key, "设置 Goal 暂停后无法确认状态")
                         self.store.save()
@@ -1469,11 +2591,37 @@ class QuotaGuard:
                             "goal_pause_verification_failed", thread_id=thread_id, turn_id=turn_id
                         )
                         continue
-                self.client.call(
-                    "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
-                )
+                    self.store.state["paused_threads"][thread_id] = {
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "title": thread.get("name") or thread.get("preview") or thread_id,
+                        "cwd": thread.get("cwd"),
+                        "reset_at": reset_at,
+                        "goal_paused_verified": True,
+                        "turn_stopped_verified": False,
+                        "stop_phase": "goal_paused_turn_pending",
+                        "goal_objective": goal.get("objective") if isinstance(goal, dict) else None,
+                        "paused_at": int(self.now()),
+                        "last_checked_at": int(self.now()),
+                    }
+                    self.store.save()
+                    self.store.event(
+                        "goal_pause_partial",
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        reset_at=reset_at,
+                        reason="等待当前 turn 完成强制中止",
+                    )
+                if not desktop_combined_goal_stop:
+                    self._interrupt_task_native(thread_id, turn_id)
                 if not self._verify_interrupted(thread_id, turn_id):
                     self._record_stop_failure(key, "中断后仍无法确认任务已停止")
+                    partial = self.store.state.get("paused_threads", {}).get(thread_id)
+                    if goal_is_active and isinstance(partial, dict):
+                        partial["stop_phase"] = "goal_paused_turn_pending"
+                        partial["last_error"] = "中断后仍无法确认任务已停止"
+                        partial["last_checked_at"] = int(self.now())
+                        self.store.event("goal_pause_partial", thread_id=thread_id, turn_id=turn_id, reset_at=reset_at, reason="中断验证失败")
                     self.store.save()
                     self.store.event(
                         "interrupt_verification_failed", thread_id=thread_id, turn_id=turn_id
@@ -1481,6 +2629,13 @@ class QuotaGuard:
                     continue
                 if goal_is_active and not self._verify_goal_status(thread_id, "paused"):
                     self._record_stop_failure(key, "中断后 Goal 状态未保持 paused")
+                    partial = self.store.state.get("paused_threads", {}).get(thread_id)
+                    if isinstance(partial, dict):
+                        partial["turn_stopped_verified"] = True
+                        partial["stop_phase"] = "turn_stopped_goal_unconfirmed"
+                        partial["last_error"] = "中断后 Goal 状态未保持 paused"
+                        partial["last_checked_at"] = int(self.now())
+                        self.store.event("goal_pause_partial", thread_id=thread_id, turn_id=turn_id, reset_at=reset_at, reason="Goal 状态验证失败")
                     self.store.save()
                     self.store.event(
                         "goal_pause_verification_failed", thread_id=thread_id, turn_id=turn_id
@@ -1491,15 +2646,20 @@ class QuotaGuard:
                     "attempts": int(attempt.get("attempts") or 0) + 1,
                     "last_attempt_at": int(self.now()),
                 }
-                self.store.state["paused_threads"][thread_id] = {
+                paused_record = self.store.state["paused_threads"].get(thread_id) or {}
+                paused_record.update({
                     "thread_id": thread_id,
                     "turn_id": turn_id,
                     "title": thread.get("name") or thread.get("preview") or thread_id,
                     "cwd": thread.get("cwd"),
                     "reset_at": reset_at,
                     "goal_paused_verified": bool(goal_is_active),
+                    "turn_stopped_verified": True,
+                    "stop_phase": "goal_paused_turn_stopped" if goal_is_active else "turn_stopped",
                     "goal_objective": goal.get("objective") if isinstance(goal, dict) else None,
-                }
+                    "last_checked_at": int(self.now()),
+                })
+                self.store.state["paused_threads"][thread_id] = paused_record
                 self.store.save()
                 self.store.event(
                     "goal_pause_and_turn_stop_verified" if goal_is_active else "forced_stop_verified",
@@ -1537,17 +2697,24 @@ class QuotaGuard:
         timeout: float = 10,
     ) -> tuple[bool, bool]:
         deadline = self.now() + max(0.1, float(timeout))
-        while self.now() <= deadline:
-            thread = self.read_thread(thread_id)
-            if isinstance(thread, dict) and thread:
-                status = (thread.get("status") or {}).get("type")
-                turn_id = in_progress_turn_id(thread)
-                if status in ACTIVE_THREAD_STATUSES and turn_id and (
-                    expected_turn_id is None or turn_id == expected_turn_id
-                ):
-                    return True, self._goal_evidence(thread)
-            self.sleep(0.25)
-        return False, False
+        operation = self._begin_action_operation("verify_turn_start", timeout)
+        result = (False, False)
+        try:
+            while self.now() <= deadline:
+                self._progress_action_operation(operation)
+                thread = self.read_thread(thread_id)
+                if isinstance(thread, dict) and thread:
+                    status = (thread.get("status") or {}).get("type")
+                    turn_id = in_progress_turn_id(thread)
+                    if status in ACTIVE_THREAD_STATUSES and turn_id and (
+                        expected_turn_id is None or turn_id == expected_turn_id
+                    ):
+                        result = (True, self._goal_evidence(thread))
+                        return result
+                self.sleep(0.25)
+            return result
+        finally:
+            self._finish_action_operation(operation, "verified" if result[0] else "failed")
 
     def _schedule_resume_retry(self, record: dict[str, Any], error: str) -> None:
         attempts = int(record.get("resume_attempts") or 0) + 1
@@ -1571,15 +2738,174 @@ class QuotaGuard:
         )
 
     def _started_turn_id(self, result: dict[str, Any]) -> str | None:
+        nested = result.get("result")
+        if isinstance(nested, dict):
+            nested_id = self._started_turn_id(nested)
+            if nested_id:
+                return nested_id
         turn = result.get("turn")
         if isinstance(turn, dict) and turn.get("id"):
             return str(turn["id"])
         value = result.get("turnId") or result.get("turn_id")
         return str(value) if value else None
 
+    def _resume_desktop_turn_only(
+        self,
+        record: dict[str, Any],
+        thread: dict[str, Any],
+        reset_at: int,
+    ) -> None:
+        """Start one fresh ordinary turn for a verified turn-only pause."""
+        thread_id = str(record.get("thread_id") or "")
+        if not thread_id:
+            return
+        status = (thread.get("status") or {}).get("type")
+        active_turn_id = in_progress_turn_id(thread)
+        if active_turn_id:
+            # The user or another controller already resumed the task.  Do
+            # not send a duplicate start request.
+            self.store.event(
+                "resume_skipped_already_active",
+                thread_id=thread_id,
+                turn_id=active_turn_id,
+                control_mode="turn_only",
+            )
+            self.store.state["paused_threads"].pop(thread_id, None)
+            return
+        if thread.get("_turns_unavailable"):
+            self._resume_failure(record, "恢复前无法读取桌面活动 turn")
+            return
+        if status in RESUME_TERMINAL_STATUSES:
+            self.store.event(
+                "resume_skipped_terminal",
+                thread_id=thread_id,
+                status=status,
+                control_mode="turn_only",
+            )
+            self.store.state["paused_threads"].pop(thread_id, None)
+            return
+        desktop_conversation_state = thread.get("_desktop_conversation_state")
+        runtime_status = (
+            desktop_conversation_state.get("threadRuntimeStatus")
+            if isinstance(desktop_conversation_state, dict)
+            else None
+        )
+        active_flags = runtime_status.get("activeFlags") if isinstance(runtime_status, dict) else None
+        desktop_idle_without_turn = (
+            thread.get("_desktop_snapshot_confirmed") is True
+            and thread.get("_desktop_turns_confirmed") is True
+            and status in ACTIVE_THREAD_STATUSES
+            and isinstance(active_flags, list)
+            and not active_flags
+        )
+        if status != "idle" and not desktop_idle_without_turn:
+            self._resume_failure(record, f"普通任务状态不明确：{status or 'unknown'}")
+            return
+        if not self._desktop_turn_only_ready(reset_at, "start"):
+            self._resume_failure(record, "桌面普通 turn 启动能力不可用")
+            return
+        if self._dry_run():
+            self.store.event(
+                "would_resume",
+                thread_id=thread_id,
+                reset_at=reset_at,
+                control_mode="turn_only",
+            )
+            return
+        message = self._resume_message(thread_id)
+        operation = {
+            "id": str(uuid.uuid4()),
+            "thread_id": thread_id,
+            "reset_at": int(reset_at),
+            "control_mode": "turn_only",
+            "phase": "turn_start_pending",
+            "started_at": int(self.now()),
+            "message": message,
+        }
+        self.store.state.setdefault("desktop_control_operations", {})[operation["id"]] = operation
+        record["control_operation_id"] = operation["id"]
+        record["resume_phase"] = "turn_start_pending"
+        record["last_checked_at"] = int(self.now())
+        self.store.save()
+        try:
+            result = self._start_turn_native(thread_id, message)
+            operation["response"] = result
+            operation["phase"] = "verification_pending"
+            started_turn_id = self._started_turn_id(result)
+            verified, _ = self._verify_started(thread_id, started_turn_id)
+            if not verified:
+                raise DesktopIPCError("启动后未确认新的活动 turn")
+        except AppServerError as error:
+            operation["phase"] = "failed"
+            operation["error"] = str(error)
+            record["resume_phase"] = "turn_start_failed"
+            record["last_resume_error"] = str(error)
+            self._resume_failure(record, str(error))
+            self.store.save()
+            self.store.event(
+                "turn_start_failed",
+                thread_id=thread_id,
+                error=str(error),
+                control_mode="turn_only",
+            )
+            return
+        operation["phase"] = "turn_started_verified"
+        operation["completed_at"] = int(self.now())
+        record["resume_phase"] = "turn_started_verified"
+        record["resume_attempts"] = 0
+        record.pop("next_resume_retry_at", None)
+        self.store.state["paused_threads"].pop(thread_id, None)
+        self.store.save()
+        self.store.event(
+            "turn_start_verified",
+            thread_id=thread_id,
+            reset_at=reset_at,
+            turn_id=started_turn_id,
+            control_mode="turn_only",
+        )
+        self.notify(
+            "Codex 额度保护",
+            f"额度已恢复，已启动新的普通任务 turn：{record.get('title') or thread_id}",
+        )
+
     def resume_paused_threads(self, limits: Limits | int) -> None:
         paused = dict(self.store.state.get("paused_threads") or {})
         if not paused or not self.config.get("resume_paused_turns", True):
+            return
+        if self.desktop_client is not None:
+            capabilities = self.store.state.get("desktop_control_capabilities") or {}
+            required_capability = (
+                "goal_resume" if self._desktop_task_mode() == "goal" else "turn_start"
+            )
+            if not getattr(self.desktop_client, f"supports_{required_capability}", False):
+                self._set_desktop_control_status(
+                    "limited",
+                    (
+                        "桌面 IPC 没有已验证的原生 Goal 恢复能力；不恢复任何旧记录"
+                        if required_capability == "goal_resume"
+                        else "桌面 IPC 没有已验证的普通 turn 启动能力；不恢复任何旧记录"
+                    ),
+                )
+                self._notify_once(
+                    f"desktop-control-unverified-resume:{required_capability}",
+                    "Codex 额度恢复受限",
+                    (
+                        "桌面 Goal 原生恢复入口尚未验证；保留恢复记录，不自动启动任何任务"
+                        if required_capability == "goal_resume"
+                        else "桌面普通 turn 启动入口尚未验证；保留恢复记录，不自动启动任何任务"
+                    ),
+                )
+                return
+        if isinstance(self.client, AppServerClient) and not self.config.get("desktop_control_verified", False):
+            self._set_desktop_control_status(
+                "limited",
+                "当前仅验证额度 app-server；未取得同一桌面任务的原生恢复入口",
+            )
+            self._notify_once(
+                "desktop-control-unverified-resume",
+                "Codex 额度恢复受限",
+                "桌面任务原生恢复入口尚未验证；保留恢复记录，不自动启动任何任务",
+            )
             return
         if isinstance(limits, int):
             primary_remaining = 101.0
@@ -1623,6 +2949,76 @@ class QuotaGuard:
                     if status == "notLoaded":
                         self._resume_failure(record, "任务仍处于 notLoaded")
                         continue
+                if record.get("control_mode") == "turn_only":
+                    self._resume_desktop_turn_only(record, thread, reset_at)
+                    continue
+                # Goal pause and turn interruption are separate native
+                # operations.  If the process died after Goal=paused but
+                # before the turn stop was verified, finish that operation
+                # before considering any resume.  Never turn a partial pause
+                # into an automatic restart merely because the reset time
+                # has arrived.
+                if record.get("goal_paused_verified") and not record.get("turn_stopped_verified"):
+                    goal_probe, goal_probe_supported = self._read_goal(thread_id, thread)
+                    goal_probe_status = self._goal_status(goal_probe)
+                    if not goal_probe_supported:
+                        self._resume_failure(record, "恢复前无法验证 Goal 是否仍归本程序暂停")
+                        continue
+                    if goal_probe_status in {"active", "complete", "blocked", "usageLimited", "budgetLimited"}:
+                        self.store.event(
+                            "resume_skipped_goal_changed_externally",
+                            thread_id=thread_id,
+                            status=goal_probe_status,
+                        )
+                        self.store.state["paused_threads"].pop(thread_id, None)
+                        continue
+                    if thread.get("_turns_unavailable"):
+                        self._resume_failure(record, "无法读取活动 turn，Goal 暂停仍待核对")
+                        continue
+                    active_turn_id = in_progress_turn_id(thread)
+                    if active_turn_id:
+                        record["turn_id"] = active_turn_id
+                        record["stop_phase"] = "goal_paused_turn_pending"
+                        record["last_checked_at"] = int(self.now())
+                        if self._dry_run():
+                            self.store.event(
+                                "would_finish_goal_pause",
+                                thread_id=thread_id,
+                                turn_id=active_turn_id,
+                            )
+                            continue
+                        stop_key = self._stop_attempt_key(reset_at, thread_id, active_turn_id)
+                        try:
+                            self._interrupt_task_native(thread_id, active_turn_id)
+                        except AppServerError as error:
+                            self._record_stop_failure(stop_key, str(error))
+                            record["last_error"] = str(error)
+                            record["last_checked_at"] = int(self.now())
+                            self.store.save()
+                            self._notify_once(
+                                f"goal-pause-retry:{thread_id}:{reset_at}",
+                                "Codex 额度保护仍未完成",
+                                f"任务 {record.get('title') or thread_id} 的 Goal 已暂停，但当前 turn 仍未停止；暂不恢复",
+                            )
+                            continue
+                        if not self._verify_interrupted(thread_id, active_turn_id):
+                            self._record_stop_failure(stop_key, "恢复前中止验证失败")
+                            record["last_error"] = "恢复前中止验证失败"
+                            record["last_checked_at"] = int(self.now())
+                            self.store.save()
+                            self._notify_once(
+                                f"goal-pause-retry:{thread_id}:{reset_at}",
+                                "Codex 额度保护仍未完成",
+                                f"任务 {record.get('title') or thread_id} 的 Goal 已暂停，但当前 turn 仍未停止；暂不恢复",
+                            )
+                            continue
+                    elif status in UNKNOWN_THREAD_STATUSES:
+                        self._resume_failure(record, "恢复前无法确认 Goal 下已无活动 turn")
+                        continue
+                    record["turn_stopped_verified"] = True
+                    record["stop_phase"] = "goal_paused_turn_stopped"
+                    record["last_checked_at"] = int(self.now())
+                    self.store.save()
                 if record.get("goal_paused_verified"):
                     goal, goal_api_supported = self._read_goal(thread_id, thread)
                     goal_status = self._goal_status(goal)
@@ -1647,9 +3043,7 @@ class QuotaGuard:
                     if self._dry_run():
                         self.store.event("would_resume_goal", thread_id=thread_id, reset_at=reset_at)
                         continue
-                    self.client.call(
-                        "thread/goal/set", {"threadId": thread_id, "status": "active"}
-                    )
+                    self._resume_goal_native(thread_id)
                     if not self._verify_goal_status(thread_id, "active"):
                         self._resume_failure(record, "恢复 Goal 后无法确认 active 状态")
                         self.store.event("goal_resume_verification_failed", thread_id=thread_id)
@@ -1728,7 +3122,12 @@ class QuotaGuard:
     def consume_reset_credit(self, limits: Limits) -> None:
         if not self.config.get("auto_consume_reset_credit", False):
             return
-        if limits.secondary_remaining is None:
+        if limits.secondary_remaining is None or limits.secondary_resets_at is None:
+            if limits.secondary_remaining is not None and limits.secondary_resets_at is None:
+                self.store.event(
+                    "reset_credit_skipped_without_reset_timestamp",
+                    secondary_remaining=limits.secondary_remaining,
+                )
             return
         if limits.secondary_remaining > float(self.config["secondary_warning_percent"]):
             return
@@ -1922,7 +3321,13 @@ class QuotaGuard:
         # quota read works.  Use a short-lived second connection for the local
         # read in production; lightweight test doubles keep the original path.
         limits = self.dynamic_tool_limits
-        if limits is None or self.dynamic_tool_limits_at is None:
+        if (
+            limits is None
+            or self.dynamic_tool_limits_at is None
+            or limits.primary_remaining is None
+            or limits.secondary_remaining is None
+            or limits.primary_resets_at is None
+        ):
             raise AppServerError("额度刷新专用会话尚未准备好有效额度快照")
         snapshot_age = self.monotonic() - self.dynamic_tool_limits_at
         if snapshot_age > 60:
@@ -1942,16 +3347,23 @@ class QuotaGuard:
             }],
         }
 
-    def _ensure_refresh_tool_client(self, timeout: float | None = None) -> AppServerClient:
+    def _ensure_refresh_tool_client(
+        self,
+        timeout: float | None = None,
+        deadline: float | None = None,
+    ) -> AppServerClient:
         """Return a pre-warmed connection reserved for dynamic tool reads."""
-        budget = max(
-            5.0,
-            float(
-                timeout
-                if timeout is not None
-                else self.config.get("scheduled_refresh_read_timeout_seconds", 30)
-            ),
+        configured_budget = float(
+            timeout
+            if timeout is not None
+            else self.config.get("scheduled_refresh_read_timeout_seconds", 30)
         )
+        if deadline is None:
+            budget = max(5.0, configured_budget)
+            connection_deadline = self.monotonic() + budget
+        else:
+            budget = min(configured_budget, max(0.1, deadline - self.monotonic()))
+            connection_deadline = deadline
         candidate = self.dynamic_tool_client
         if candidate is not None and (
             candidate.socket is not None and candidate._connection_error is None
@@ -1966,11 +3378,11 @@ class QuotaGuard:
             self.client.socket_path,
             request_timeout=budget,
         )
-        candidate.start(deadline=self.monotonic() + budget)
+        candidate.start(deadline=connection_deadline)
         self.dynamic_tool_client = candidate
         return candidate
 
-    def _prepare_refresh_tool_snapshot(self) -> Limits:
+    def _prepare_refresh_tool_snapshot(self, deadline: float | None = None) -> Limits:
         """Read a fresh snapshot before starting the model turn.
 
         The dynamic-tool callback has a short server-side response window.
@@ -1979,15 +3391,13 @@ class QuotaGuard:
         slow.  This remains a local app-server read and does not create a
         model turn.
         """
-        timeout = max(
-            5.0,
-            float(self.config.get("scheduled_refresh_read_timeout_seconds", 30)),
-        )
+        timeout = max(5.0, float(self.config.get("scheduled_refresh_read_timeout_seconds", 30)))
+        deadline = deadline or self.monotonic() + timeout
         if isinstance(self.client, AppServerClient):
-            tool_client = self._ensure_refresh_tool_client(timeout)
+            tool_client = self._ensure_refresh_tool_client(timeout, deadline=deadline)
             limits = self.read_limits(
                 client=tool_client,
-                deadline=self.monotonic() + timeout,
+                deadline=deadline,
             )
         else:
             limits = self.read_limits()
@@ -2028,7 +3438,11 @@ class QuotaGuard:
                 return str(value)
         return None
 
-    def _ensure_refresh_bridge_thread(self, pending: dict[str, Any]) -> str | None:
+    def _ensure_refresh_bridge_thread(
+        self,
+        pending: dict[str, Any],
+        deadline: float | None = None,
+    ) -> str | None:
         """Create or reuse the guard-owned desktop Codex conversation.
 
         The previous ``codex_automation`` mode only recorded a delegation; it
@@ -2045,7 +3459,7 @@ class QuotaGuard:
         )
         if bridge_id:
             try:
-                thread = self.read_thread(str(bridge_id))
+                thread = self.read_thread(str(bridge_id), deadline=deadline)
             except AppServerMethodError as error:
                 message = error.message.lower()
                 if "not found" not in message and "not loaded" not in message:
@@ -2118,7 +3532,7 @@ class QuotaGuard:
             "dynamicTools": self._refresh_dynamic_tools(),
         }
         try:
-            result = self.client.call("thread/start", params)
+            result = self._call_with_deadline("thread/start", params, deadline)
         except (AppServerError, OSError) as error:
             self._queue_refresh_retry(pending, "refresh_bridge_thread_create_failed", str(error))
             self._notify_once(
@@ -2480,7 +3894,12 @@ class QuotaGuard:
                 self.store.state["pending_scheduled_refresh"] = pending
         if not pending or int(pending.get("next_retry_at") or 0) > int(self.now()):
             return
+        delivery_deadline: float | None = None
         if self.config.get("scheduled_refresh_delivery") == "local_app_server_bridge":
+            delivery_deadline = self.monotonic() + max(
+                5.0,
+                float(self.config.get("scheduled_refresh_read_timeout_seconds", 30)),
+            )
             # A legacy delegated event was never sent.  Re-open it as a real
             # local conversation event; this is safe because no turn id was
             # recorded as accepted by the old automation path.
@@ -2503,20 +3922,26 @@ class QuotaGuard:
                         # app-server gives a dynamic tool only a short window
                         # to answer, so opening this socket from inside the
                         # tool callback is too late on a cold launch.
-                        self._prepare_refresh_tool_snapshot()
+                        self._prepare_refresh_tool_snapshot(deadline=delivery_deadline)
                     except (AppServerError, OSError, subprocess.SubprocessError) as error:
-                        self._queue_refresh_retry(
-                            pending,
-                            "refresh_tool_connection_failed",
-                            str(error),
+                        # Prefetch is an optimization, not proof that the
+                        # scheduled message itself was accepted.  Keep the
+                        # durable event and proceed to turn/start so the
+                        # dynamic tool can return a verified failure instead
+                        # of silently dropping the scheduled reset request.
+                        self.dynamic_tool_limits = None
+                        self.dynamic_tool_limits_at = None
+                        self.store.event(
+                            "refresh_tool_prefetch_failed",
+                            event_id=pending.get("event_id"),
+                            error=str(error),
                         )
                         self._notify_once(
                             "refresh-tool-connection-failed",
                             "Codex 定时会话额度工具不可用",
-                            f"额度工具连接尚未就绪，将按退避重试：{error}",
+                            f"额度工具预取失败，将继续提交会话；工具失败时不会确认额度刷新：{error}",
                         )
-                        return
-                if self._ensure_refresh_bridge_thread(pending) is None:
+                if self._ensure_refresh_bridge_thread(pending, deadline=delivery_deadline) is None:
                     return
         target = self._retarget_pending_refresh(pending)
         pending.setdefault("status", "pending")
@@ -2613,10 +4038,14 @@ class QuotaGuard:
                     "不要修改项目或设置。"
                 )
                 try:
-                    result = self.client.call("turn/start", {
-                        "threadId": target,
-                        "input": [{"type": "text", "text": prompt}],
-                    })
+                    result = self._call_with_deadline(
+                        "turn/start",
+                        {
+                            "threadId": target,
+                            "input": [{"type": "text", "text": prompt}],
+                        },
+                        delivery_deadline,
+                    )
                     turn_id = self._started_turn_id(result)
                     if not turn_id:
                         raise AppServerError("会话请求返回但没有 turn id，提交状态待确认")
@@ -2651,6 +4080,14 @@ class QuotaGuard:
             pending["status"] = "confirmed"
             pending["notification_delivered"] = True
             self.store.event(
+                "scheduled_refresh_completed",
+                event_id=pending.get("event_id"),
+                scheduled_at=pending.get("scheduled_at"),
+                missed_count=pending.get("missed_count", 0),
+                notification_delivered=True,
+                conversation_submitted=bool(pending.get("conversation_submitted")),
+            )
+            self.store.event(
                 "scheduled_refresh_notification_delivered",
                 scheduled_at=pending.get("scheduled_at"),
                 missed_count=pending.get("missed_count", 0),
@@ -2675,7 +4112,7 @@ class QuotaGuard:
         )
         self.store.save()
 
-    def _process_fixed_refresh(self, limits: Limits) -> None:
+    def _process_fixed_refresh(self, limits: Limits | None) -> None:
         if not self.config.get("scheduled_refresh_enabled", True):
             return
         now = self.now()
@@ -2702,13 +4139,15 @@ class QuotaGuard:
         pending = self.store.state.get("pending_scheduled_refresh") or {}
         missed_count = max(0, len(due_times) - 1)
         event_id = f"{self.config.get('scheduled_refresh_thread_id') or 'notification'}:{int(due_times[-1])}"
+        primary_remaining = limits.primary_remaining if limits is not None else None
+        secondary_remaining = limits.secondary_remaining if limits is not None else None
         event = {
             "event_id": event_id,
             "target_thread_id": self.config.get("scheduled_refresh_thread_id") or None,
             "scheduled_at": due_times[-1],
             "missed_count": missed_count,
-            "primary_remaining": limits.primary_remaining,
-            "secondary_remaining": limits.secondary_remaining,
+            "primary_remaining": primary_remaining,
+            "secondary_remaining": secondary_remaining,
             "notification_attempts": 0,
             "next_retry_at": int(now),
             "status": "pending",
@@ -2725,13 +4164,28 @@ class QuotaGuard:
         elif active.get("event_id") == event_id:
             active.update(event)
         self.store.event(
-            "scheduled_refresh_completed",
+            "scheduled_refresh_event_created",
             scheduled_at=due_times[-1],
             missed_count=missed_count,
-            primary_remaining=limits.primary_remaining,
-            secondary_remaining=limits.secondary_remaining,
+            primary_remaining=primary_remaining,
+            secondary_remaining=secondary_remaining,
             notification_delivered=False,
         )
+        # The legacy local notification adapter has no dedicated session to
+        # receive a refresh request.  Keep the durable event queued until a
+        # valid snapshot is available instead of reporting a notification as
+        # a successful quota refresh.  The bridge adapter deliberately
+        # proceeds with turn/start even when its dynamic tool prefetch fails.
+        if (
+            limits is None
+            and self.config.get("scheduled_refresh_delivery") != "local_app_server_bridge"
+        ):
+            self.store.event(
+                "scheduled_refresh_waiting_for_quota_snapshot",
+                scheduled_at=due_times[-1],
+            )
+            self.store.save()
+            return
         self._deliver_pending_refresh()
 
     def run_once(self) -> Limits:
@@ -2890,6 +4344,7 @@ class QuotaReader:
 
     def _write_health(self, status: str, **details: Any) -> None:
         payload = {
+            "role": "reader",
             "pid": os.getpid(),
             "instance_id": self.instance_id,
             "process_started_at": self.process_started_at,
@@ -2938,7 +4393,7 @@ class QuotaReader:
         self.state["quota_check_mode"] = mode
         self.next_quota_check_at = now + interval
         self.state["next_quota_check_at"] = self.next_quota_check_at
-        expiry = now + interval + int(self.config["quota_read_timeout_seconds"])
+        expiry = now + interval + int(self._read_timeout_seconds())
         self.state["primary_data_expires_at"] = expiry if limits.primary_remaining is not None else now
         self.state["secondary_data_expires_at"] = expiry if limits.secondary_remaining is not None else now
         self.state["last_error"] = error
@@ -3074,10 +4529,11 @@ class ActionProcess:
 
     def __init__(
         self,
-        client: AppServerClient | None,
+        client: Any | None,
         config: dict[str, Any],
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        desktop_client: DesktopIPCClient | None = None,
     ):
         self.config = dict(config)
         self.config["health_file"] = self.config["actions_health_file"]
@@ -3085,12 +4541,20 @@ class ActionProcess:
         self.now = now
         self.sleep = sleep
         self.client = client
+        self.desktop_client = desktop_client
         self.store = StateStore(
             pathlib.Path(self.config["state_file"]).expanduser(),
             pathlib.Path(self.config["event_log_file"]).expanduser(),
             persist=not bool(self.config.get("dry_run")),
         )
-        self.guard = QuotaGuard(client, self.config, self.store, now=now, sleep=sleep)
+        self.guard = QuotaGuard(
+            client,
+            self.config,
+            self.store,
+            now=now,
+            sleep=sleep,
+            desktop_client=desktop_client,
+        )
         self._restore_observed_limits()
         if self.client is not None:
             try:
@@ -3135,6 +4599,47 @@ class ActionProcess:
             record.get("secondary_remaining"),
             record.get("primary_resets_at"),
             record.get("secondary_resets_at"),
+            int(record.get("reset_credit_count") or 0),
+            [item for item in (record.get("reset_credits") or []) if isinstance(item, dict)],
+            {},
+        )
+
+    def _partial_limits_from_record(self, record: dict[str, Any]) -> Limits | None:
+        """Build a snapshot when exactly one window is independently fresh.
+
+        Primary protection only needs a fresh primary window and its reset
+        timestamp; bank-reset decisions only use a fresh secondary window.
+        The dynamic refresh tool still requires both windows and is cleared by
+        the caller for partial records.
+        """
+        values: dict[str, float | None] = {}
+        resets: dict[str, Any] = {}
+        for label in ("primary", "secondary"):
+            value = record.get(f"{label}_remaining")
+            expiry = timestamp_value(record.get(f"{label}_data_expires_at"))
+            status = record.get(f"{label}_data_status")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                numeric = None
+            current = (
+                numeric is not None
+                and math.isfinite(numeric)
+                and 0.0 <= numeric <= 100.0
+                and not isinstance(value, bool)
+                and str(status or "current") == "current"
+                and expiry is not None
+                and self.now() <= expiry
+            )
+            values[label] = numeric if current else None
+            resets[label] = record.get(f"{label}_resets_at") if current else None
+        if values["primary"] is None and values["secondary"] is None:
+            return None
+        return Limits(
+            values["primary"],
+            values["secondary"],
+            resets["primary"],
+            resets["secondary"],
             int(record.get("reset_credit_count") or 0),
             [item for item in (record.get("reset_credits") or []) if isinstance(item, dict)],
             {},
@@ -3261,10 +4766,17 @@ class ActionProcess:
             if sequence <= consumed:
                 continue
             validity = self._record_validity(record)
-            limits = self._limits_from_record(record) if validity == "current" else None
+            limits = self._limits_from_record(record) if validity == "current" else self._partial_limits_from_record(record)
             if limits is None:
                 self._mirror_reader_result(record, validity)
                 self._remember_reader_result(record)
+                # An invalid or expired reader result must never leave the
+                # previous dynamic-tool snapshot looking current.  The
+                # scheduled event is still processed independently below;
+                # only the quota-tool evidence is unavailable.
+                self.guard.dynamic_tool_limits = None
+                self.guard.dynamic_tool_limits_at = None
+                self.guard._process_fixed_refresh(None)
                 consumed = sequence
                 self.store.state["last_consumed_quota_sequence"] = sequence
                 self.store.event(
@@ -3279,9 +4791,25 @@ class ActionProcess:
                 self.store.event("actions_unavailable", sequence=sequence)
                 self.store.save()
                 return
+            if validity != "current":
+                self.store.event(
+                    "quota_result_partial",
+                    sequence=sequence,
+                    reason=validity,
+                )
             # Do not advance the consumer cursor until all action work for this
             # sequence has completed.  A crashed/unavailable action process can
             # therefore inspect the immutable result again after restart.
+            if (
+                limits.primary_remaining is not None
+                and limits.secondary_remaining is not None
+                and limits.primary_resets_at is not None
+            ):
+                self.guard.dynamic_tool_limits = limits
+                self.guard.dynamic_tool_limits_at = self.guard.monotonic()
+            else:
+                self.guard.dynamic_tool_limits = None
+                self.guard.dynamic_tool_limits_at = None
             self.guard.handle_limits(limits, record=False)
             self.guard._process_fixed_refresh(limits)
             self._mirror_reader_result(record, validity)
@@ -3317,8 +4845,9 @@ class ActionProcess:
             try:
                 self.process_results()
                 latest = self._latest_limits()
-                if latest is not None:
-                    self.guard._process_fixed_refresh(latest)
+                # Fixed refresh delivery is independent of quota validity;
+                # an unavailable snapshot must not erase a due event.
+                self.guard._process_fixed_refresh(latest)
                 self.guard._write_health("actions_waiting")
                 if self.client is None:
                     self.sleep(1)
@@ -3329,6 +4858,8 @@ class ActionProcess:
                 self.guard._write_health("actions_error", error=str(error))
                 if self.client is not None:
                     self.client.close()
+                if self.desktop_client is not None:
+                    self.desktop_client.close()
                 self._interruptible_reconnect_sleep(min(60, backoff))
                 backoff = min(60, backoff * 2)
 
@@ -3347,6 +4878,8 @@ class ActionProcess:
 
     def close(self) -> None:
         self.guard.close()
+        if self.desktop_client is not None:
+            self.desktop_client.close()
 
 
 class QuotaSupervisor:
@@ -3414,6 +4947,7 @@ class QuotaSupervisor:
         if self.config.get("dry_run"):
             return
         payload = {
+            "role": "supervisor",
             "pid": os.getpid(),
             "instance_id": self.instance_id,
             "process_started_at": self.process_started_at,
@@ -3638,6 +5172,14 @@ class QuotaSupervisor:
             if now - started > grace:
                 return True, "actions 心跳无效"
             return False, "actions 正在启动"
+        operation = health.get("action_operation")
+        if isinstance(operation, dict):
+            operation_deadline = timestamp_value(operation.get("deadline_at"))
+            if operation_deadline is not None and now > operation_deadline:
+                return True, f"actions 操作超过期限：{operation.get('name') or 'unknown'}"
+            operation_progress = timestamp_value(operation.get("progress_at"))
+            if operation_progress is not None and now - operation_progress > grace:
+                return True, f"actions 操作进度过期：{operation.get('name') or 'unknown'}"
         age = now - heartbeat_value
         if age > grace:
             return True, f"actions 心跳过期 {age:.1f}s"
@@ -3745,12 +5287,72 @@ def print_status(config: dict[str, Any]) -> None:
     print(json.dumps(state, ensure_ascii=False, indent=2))
 
 
+def desktop_control_check(config: dict[str, Any], thread_id: str | None = None) -> dict[str, Any]:
+    """Run a read-only desktop task capability and state probe.
+
+    This command never sends a follower write request and never starts the
+    managed app-server.  It is the first step of acceptance for a configured
+    turn-only task; actual stop/start acceptance remains an explicit write
+    test on a dedicated thread.
+    """
+    candidates = [str(item) for item in (config.get("desktop_control_thread_ids") or []) if str(item)]
+    selected = str(thread_id or "")
+    if not selected:
+        if len(candidates) != 1:
+            return {
+                "ok": False,
+                "error": "请通过 --desktop-thread-id 指定一个线程，或让 desktop_control_thread_ids 只包含一个线程",
+            }
+        selected = candidates[0]
+    client = DesktopIPCClient(
+        str(config["desktop_ipc_socket"]),
+        request_timeout=float(config["quota_read_timeout_seconds"]),
+    )
+    try:
+        snapshot = client.read_thread(selected, timeout=float(config["quota_read_timeout_seconds"]))
+        goal, goal_supported = client.read_goal(snapshot)
+        active_turn_id = in_progress_turn_id(snapshot)
+        return {
+            "ok": True,
+            "thread_id": selected,
+            "desktop_owner_client_id": snapshot.get("_desktop_owner_client_id"),
+            "snapshot_revision": snapshot.get("_desktop_snapshot_revision"),
+            "snapshot_at": snapshot.get("_desktop_snapshot_at"),
+            "thread_status": (snapshot.get("status") or {}).get("type"),
+            "active_turn_id": active_turn_id,
+            "goal_state_reported": goal_supported,
+            "goal_status": (goal or {}).get("status") if isinstance(goal, dict) else None,
+            "task_mode": str(config.get("desktop_control_task_mode") or "turn_only"),
+            "capabilities": {
+                "owner_discovery": True,
+                "state_subscription": True,
+                "canonical_history": bool(snapshot.get("_desktop_turns_confirmed")),
+                "turn_interrupt": bool(client.supports_turn_interrupt),
+                "turn_start": bool(client.supports_turn_start),
+                "goal_pause": bool(client.supports_goal_pause),
+                "goal_resume": bool(client.supports_goal_resume),
+            },
+            "writes_sent": False,
+        }
+    except (DesktopIPCError, OSError, ValueError) as error:
+        return {
+            "ok": False,
+            "thread_id": selected,
+            "error": str(error),
+            "writes_sent": False,
+        }
+    finally:
+        client.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="事件驱动的 Codex 本地额度保护器")
     parser.add_argument("--config", required=True, help="JSON 配置文件")
     parser.add_argument("--once", action="store_true", help="只读取并执行一次策略")
     parser.add_argument("--status", action="store_true", help="打印持久化状态后退出")
     parser.add_argument("--dry-run", action="store_true", help="只记录动作，不中断、恢复或消耗重置卡")
+    parser.add_argument("--desktop-check", action="store_true", help="只读检查桌面线程和普通 turn 控制能力")
+    parser.add_argument("--desktop-thread-id", help="只读桌面检查的线程 ID")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--reader", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--actions", action="store_true", help=argparse.SUPPRESS)
@@ -3763,6 +5365,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.status:
         print_status(config)
         return 0
+    if args.desktop_check:
+        report = desktop_control_check(config, args.desktop_thread_id)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report.get("ok") else 1
 
     if args.worker:
         args.supervise = True
@@ -3805,7 +5411,13 @@ def main(argv: list[str] | None = None) -> int:
             str(config["app_server_socket"]),
             request_timeout=float(config["quota_read_timeout_seconds"]),
         )
-        actions = ActionProcess(client, config)
+        desktop_client: DesktopIPCClient | None = None
+        if config.get("desktop_control_mode") in {"readonly", "control"}:
+            desktop_client = DesktopIPCClient(
+                str(config["desktop_ipc_socket"]),
+                request_timeout=float(config["quota_read_timeout_seconds"]),
+            )
+        actions = ActionProcess(client, config, desktop_client=desktop_client)
         try:
             actions.run_forever()
         except KeyboardInterrupt:
@@ -3820,12 +5432,22 @@ def main(argv: list[str] | None = None) -> int:
         pathlib.Path(config["event_log_file"]).expanduser(),
         persist=not bool(config.get("dry_run")),
     )
+    client_config = dict(config)
+    if args.once:
+        # A one-shot read is a reader operation, not an action-control call.
+        # Use the same bounded reader budget as the isolated reader so a slow
+        # managed app-server does not make the documented diagnostic command
+        # fail at the shorter 5-second action budget.
+        client_config["quota_read_timeout_seconds"] = config.get(
+            "reader_quota_read_timeout_seconds",
+            config["quota_read_timeout_seconds"],
+        )
     client = AppServerClient(
         executable,
         str(config["app_server_socket"]),
-        request_timeout=float(config["quota_read_timeout_seconds"]),
+        request_timeout=float(client_config["quota_read_timeout_seconds"]),
     )
-    guard = QuotaGuard(client, config, store)
+    guard = QuotaGuard(client, client_config, store)
     client.dynamic_tool_handler = guard._handle_refresh_dynamic_tool
     try:
         if args.once:

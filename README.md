@@ -1,10 +1,12 @@
 # Codex Quota Guard
 
-这是一个本地、低开销的 Codex 额度保护小程序。它连接本机 Codex 管理的 app-server 控制 socket（默认 `~/.codex/app-server-control/app-server-control.sock`），而不是另起一个隔离的 app-server；读取额度不会启动模型，也不会消耗 Codex 的模型额度。
+这是一个本地、低开销的 Codex 额度保护小程序。额度读取和定时刷新继续使用本机 Codex 管理的 app-server 控制 socket（默认 `~/.codex/app-server-control/app-server-control.sock`）；桌面任务状态和控制则通过独立的桌面 IPC（默认 `~/.codex/ipc/ipc.sock`）按 allow-list 读取。读取额度或订阅桌面状态不会启动模型，也不会消耗 Codex 的模型额度。
 
 额度检测有三层护栏：额度事件到达时立即读取；事件丢失时，按两个窗口中较低的有效余量使用梯度间隔本地读取；独立监督进程每 5 秒检查读取进程、动作进程、心跳、读取请求期限和两个窗口的数据期限。默认曲线锚点为：100% 读一次后等待 600 秒、90% 等待 500 秒、20% 等待 200 秒、19% 等待 90 秒、10% 等待 10 秒，低于 10% 固定每 5 秒读取。独立读取进程的额度 RPC 总超时默认 30 秒，以覆盖真实 managed app-server 的慢响应；因此事件丢失时的最大检测延迟约为：100% 时 630 秒、90% 时 530 秒、20% 时 230 秒、19% 时 120 秒、10% 时 40 秒、低于 10% 时 35 秒。任一窗口数据无效时使用 5 秒安全间隔。兜底读取只调用本地额度接口，不启动模型 turn。
 
-默认策略是：5 小时余量低于 `primary_warning_percent` 时，枚举未归档且确实处于 active 的任务。普通 turn 调用原生 `turn/interrupt` 并读取线程确认已经停止；检测到原生 Goal 时先调用 `thread/goal/set(status=paused)`，再中止当前 turn，并同时验证 Goal 已 paused、turn 已结束，才加入恢复名单。重置时间到达后再等待 `post_reset_delay_seconds`；Goal 通过 `thread/goal/set(status=active)` 恢复并验证，普通 turn 才发送配置中的继续消息。Goal 控制接口缺失或验证不确定时保持未确认，不把普通消息、归档或 handoff 冒充 Goal 暂停。总额度低于 `secondary_warning_percent` 时，若有可用重置卡，调用 Codex 原生 `account/rateLimitResetCredit/consume`；没有可用卡或调用失败会写入事件日志并弹出通知，不会假装成功。
+默认策略是：5 小时余量低于 `primary_warning_percent` 时，只有在 `desktop_control_mode=control` 且目标在线程 allow-list 中时，才依据桌面 IPC 的新鲜活动 turn执行原生控制。`desktop_control_task_mode=turn_only` 会用精确 `turnId` 停止当前普通 turn，并在额度恢复后通过 `thread-follower-start-turn` 启动一个新的普通 turn；两步都必须查询桌面快照验证，不能把新 turn 当作 Goal 恢复。`desktop_control_task_mode=goal` 仍要求独立后台可调用的原生 Goal 暂停/恢复入口；当前适配器明确不把普通 turn、普通消息、归档或 handoff 当作 Goal 恢复，因此入口缺失时保持恢复记录和受限状态。总额度低于 `secondary_warning_percent` 时，若有可用重置卡，调用 Codex 原生 `account/rateLimitResetCredit/consume`；没有可用卡或调用失败会写入事件日志并弹出通知，不会假装成功。
+
+生产环境的 `desktop_control_mode` 默认是 `disabled`，`desktop_control_thread_ids` 默认为空，写操作还必须显式启用。`desktop_control_task_mode` 默认是 `turn_only`；只有显式改为 `goal` 才会走 Goal 控制。旧的 `desktop_control_verified` 只为兼容读取，不能作为能力证明。额度 app-server 能读到不等于它连接的是桌面 Codex 的同一任务视图；桌面适配器会先做 owner discovery，再订阅 canonical history，遇到空响应、版本断档、归属变化或过期快照就拒绝控制。可用 `python3 codex_quota_guard.py --config <config> --desktop-check --desktop-thread-id <thread-id>` 做只读检查；该命令不会发送 turn。安装脚本会按 `turn_only` 或 `goal` 模式分别核对所需能力。
 
 ## 使用
 
@@ -40,7 +42,7 @@
 
 提交记录包含 thread ID、turn ID 和受理/完成状态。定时事件会先通过独立本地连接预取并验证当前额度快照，再让动态工具在 Codex 会话的短响应窗口内即时返回；额度快照或 `get_usage_limits` 成功证据缺失时，不能只凭 turn completed 标记刷新成功。当前 managed app-server 若不支持 `thread/read(includeTurns=true)`，守护程序会退回到不带 turns 的线程状态，并使用 `turn/completed` 通知继续查询；没有成功工具证据前不会标记定时会话成功。预取默认最多等待 30 秒，期间不启动模型 turn。该会话会使用少量模型额度，桌面通知只是附加提醒。此设置不会调用 bank reset。
 
-`LaunchAgent.template.plist` 是模板；需要启用新版后台时运行 `./install_quota_guard.sh`。脚本会使用当前 `python3` 的绝对路径，备份旧 LaunchAgent、配置、状态和已安装 APP，再用 `--supervise` 加载并确认 `reader-health.json`、`actions-health.json`、`watchdog.json` 的 PID、实例、配置版本和新鲜心跳；若确认超时，会卸载本次新服务并恢复备份的 LaunchAgent 与 APP。模板启动的是 `--supervise`：监督进程只管理自己创建的读取进程和动作进程；读取进程 10 分钟内最多自动重启 3 次，随后暂停重启 10 分钟，避免重启风暴。动作进程异常只报警并保留未核对动作，不自动重放。若只想暂时运行，可直接使用 `python3 codex_quota_guard.py --config config.json --worker`；`--worker` 只是兼容入口，会映射到完整监督结构。
+`LaunchAgent.template.plist` 是模板；需要启用后台时运行 `./install_quota_guard.sh`。脚本会使用当前 `python3` 的绝对路径，备份旧 LaunchAgent、配置、状态和已安装 APP，再用 `--supervise` 加载并确认 `reader-health.json`、`actions-health.json`、`watchdog.json` 的 PID、实例、配置版本和新鲜心跳；若确认超时，会卸载本次新服务并恢复备份的 LaunchAgent 与 APP。安装前还会核对当前状态中的 owner discovery、状态订阅、turn 中止、Goal 暂停和 Goal 恢复证据；任何缺失都拒绝部署，不读取旧布尔开关冒充通过。模板启动的是 `--supervise`：监督进程只管理自己创建的读取进程和动作进程；读取进程 10 分钟内最多自动重启 3 次，随后暂停重启 10 分钟，避免重启风暴。动作进程异常只报警并保留未核对动作，不自动重放。若只想暂时运行，可直接使用 `python3 codex_quota_guard.py --config config.json --worker`；`--worker` 只是兼容入口，会映射到完整监督结构。
 
 监督入口会分别启动 `--reader`、`--actions` 两个子进程。读取进程写入 `reader-health.json`、`reader-state.json` 和只追加的 `quota-results.jsonl`；动作进程写入 `actions-health.json`、现有 `state.json`；监督进程写入 `watchdog.json`。动作进程消费结果前会检查两个窗口的数据期限；过期或缺少期限的历史结果只记录并推进序号，不会触发暂停、恢复、定时会话或 bank reset。设置界面分别显示读取、动作和监督状态，并显示刷新时间、两个额度窗口的最后成功时间与过期状态；旧 `health.json` 只作为诊断提示，不能代表新版三层后台已运行。动作失败或接口持续不可用不会被旧额度掩盖，也不会把额度检测成功宣称为任务暂停成功。
 
