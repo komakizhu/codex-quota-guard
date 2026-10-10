@@ -26,7 +26,7 @@ jobs:
         run: |
           ./build_settings_app.sh
           codesign --verify --deep --strict CodexQuotaGuardSettings.app
-          test "$(plutil -extract CFBundleVersion raw -o - CodexQuotaGuardSettings.app/Contents/Info.plist)" = 12
+          test "$(plutil -extract CFBundleVersion raw -o - CodexQuotaGuardSettings.app/Contents/Info.plist)" = 29
           lipo CodexQuotaGuardSettings.app/Contents/MacOS/CodexQuotaGuardSettings -verify_arch arm64
           test -s CodexQuotaGuardSettings.app/Contents/Resources/AppIcon.icns
       - name: Package
@@ -34,7 +34,7 @@ jobs:
           mkdir -p release-assets/CodexQuotaGuard
           ditto CodexQuotaGuardSettings.app release-assets/CodexQuotaGuard/CodexQuotaGuardSettings.app
           cp codex_quota_guard.py config.example.json LaunchAgent.template.plist README.md release-assets/CodexQuotaGuard/
-          ditto -c -k --sequesterRsrc --keepParent release-assets/CodexQuotaGuard release-assets/CodexQuotaGuard-macOS-arm64-Build12.zip
+          ditto -c -k --sequesterRsrc --keepParent release-assets/CodexQuotaGuard release-assets/CodexQuotaGuard-macOS-arm64-Build29.zip
       - uses: actions/upload-artifact@v4
         with:
           name: macos-release
@@ -57,4 +57,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG_NAME" release-assets/*.zip --verify-tag --latest --title "Codex Quota Guard 1.0 — Build 12" --notes-file RELEASE_NOTES.md
+          gh release create "$TAG_NAME" release-assets/*.zip --verify-tag --latest --title "Codex Quota Guard 1.0 — Build 29" --notes-file RELEASE_NOTES.md

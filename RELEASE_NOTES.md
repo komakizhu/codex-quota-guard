@@ -1,11 +1,12 @@
 # Codex Quota Guard 1.0 — Build 29
 
-## 未发布的 Build 30 工作区变更
+## 本次 Build 29 更新
 
 - 增加真实桌面 IPC 的只读 owner discovery、状态订阅、canonical history 解析和活动 turn 识别，避免把 managed app-server 的 `notLoaded` 当作桌面任务空闲。
 - 增加安全的桌面控制适配边界：Goal 暂停/turn 中止必须来自桌面 owner，Goal 恢复在没有后台可验证原生入口时明确阻塞，不用普通消息或 `thread-follower-start-turn` 冒充恢复。
 - 增加协议、canonical history、allow-list 隔离和恢复受限回归测试；安装脚本不再把 `desktop_control_verified` 布尔值当作完整能力证据。
-- 本次真实检查已证明桌面状态读取和 owner 归属；尚未取得 Goal 原生恢复证据，因此没有编译、部署或覆盖安装 Build 30。
+- 本次真实检查已证明桌面状态读取、owner 归属和活动 turn 识别；Goal 原生恢复仍受桌面后台入口限制，不把普通 turn 控制冒充为 Goal 控制。
+- 普通任务支持显式白名单的 turn-only 停止/继续适配和只读验收探测；写操作默认关闭，未对用户任务执行真实停止或启动。
 
 - Build 29：修复 Goal 暂停成功但 turn 中止失败后的部分状态丢失；恢复前会先完成未决 turn 中止。桌面任务控制与额度读取分开报告，`notLoaded` 不再被当作空闲；定时刷新事件在额度读取失败时仍持久化并按专用会话路径处理，额度工具证据缺失不会误报刷新成功。读取期限使用 reader 实际预算；设置界面核对 PID 存活、配置版本和桌面控制能力。
 
